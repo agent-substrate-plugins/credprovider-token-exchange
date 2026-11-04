@@ -16,8 +16,8 @@
 // trust bundles. A credential bundle is one PEM file holding a PRIVATE KEY block
 // and the CERTIFICATE chain, leaf first, with or without the root.
 //
-// It is the server-side subset of substrate's internal/credbundle, copied so
-// this module depends only on substrate's public packages.
+// It is a subset of substrate's internal/credbundle, copied so this module
+// depends only on substrate's public packages.
 package credbundle
 
 import (
@@ -36,6 +36,14 @@ import (
 func Loader(path string) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	c := &certCache{path: path}
 	return func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return c.get()
+	}
+}
+
+// ClientLoader is Loader for a tls.Config GetClientCertificate function.
+func ClientLoader(path string) func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	c := &certCache{path: path}
+	return func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
 		return c.get()
 	}
 }
