@@ -76,7 +76,7 @@ policy:
 
 func newServer(t *testing.T, m Minter, e Exchanger) *Server {
 	t.Helper()
-	return NewServer(testConfig(t), m, e, 0)
+	return NewServer(context.Background(), testConfig(t), m, e, 0)
 }
 
 func TestParseURI(t *testing.T) {
@@ -142,8 +142,7 @@ func (m *fakeMinter) MintActorJWT(_ context.Context, atespace, name, aud string)
 
 type fakeExchanger struct {
 	calls    atomic.Int32
-	lifetime time.Duration
-	now      func() time.Time
+	lifetime time.Duration // zero means no expiry
 	block    chan struct{}
 }
 
@@ -156,7 +155,11 @@ func (e *fakeExchanger) Exchange(ctx context.Context, _, subjectToken, _ string,
 			return tokenexchange.Token{}, status.FromContextError(ctx.Err()).Err()
 		}
 	}
-	return tokenexchange.Token{AccessToken: subjectToken + "#" + strconv.Itoa(int(n)), ExpiresAt: e.now().Add(e.lifetime)}, nil
+	t := tokenexchange.Token{AccessToken: subjectToken + "#" + strconv.Itoa(int(n))}
+	if e.lifetime > 0 {
+		t.ExpiresAt = time.Now().Add(e.lifetime)
+	}
+	return t, nil
 }
 
 func fetch(s *Server, uri, actor string) (string, error) {
@@ -166,7 +169,7 @@ func fetch(s *Server, uri, actor string) (string, error) {
 
 func TestFetchSecretPolicy(t *testing.T) {
 	m := &fakeMinter{}
-	s := newServer(t, m, &fakeExchanger{lifetime: time.Hour, now: time.Now})
+	s := newServer(t, m, &fakeExchanger{lifetime: time.Hour})
 	for name, tc := range map[string]struct {
 		uri, actor string
 		want       codes.Code
@@ -192,14 +195,136 @@ func TestFetchSecretPolicy(t *testing.T) {
 
 func TestFetchSecretTimeout(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		ex := &fakeExchanger{lifetime: time.Hour, now: time.Now, block: make(chan struct{})}
-		s := NewServer(testConfig(t), &fakeMinter{}, ex, time.Second)
+		ex := &fakeExchanger{lifetime: time.Hour, block: make(chan struct{})}
+		s := NewServer(context.Background(), testConfig(t), &fakeMinter{}, ex, time.Second)
 		start := time.Now()
 		if _, err := fetch(s, apiURI, actorID); status.Code(err) != codes.DeadlineExceeded {
 			t.Errorf("got %v, want DeadlineExceeded", err)
 		}
 		if got := time.Since(start); got != time.Second {
 			t.Errorf("exchange gave up after %v, want the 1s fetch timeout", got)
+		}
+	})
+}
+
+func TestFetchSecretCacheLifetime(t *testing.T) {
+	for name, tc := range map[string]struct {
+		lifetime         time.Duration
+		cachedFor        time.Duration // still cached just before this
+		wantNoCacheAtAll bool
+	}{
+		"a third of the lifetime remains": {lifetime: time.Hour, cachedFor: 40 * time.Minute},
+		"30s remain":                      {lifetime: 60 * time.Second, cachedFor: 30 * time.Second},
+		"capped at maxReuse":              {lifetime: 48 * time.Hour, cachedFor: maxReuse},
+		"unknown expiry":                  {lifetime: 0, cachedFor: unknownExpiryReuse},
+		"30s or less is never cached":     {lifetime: 30 * time.Second, wantNoCacheAtAll: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s := newServer(t, &fakeMinter{}, &fakeExchanger{lifetime: tc.lifetime})
+				first, err := fetch(s, apiURI, actorID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.wantNoCacheAtAll {
+					if got, _ := fetch(s, apiURI, actorID); got == first {
+						t.Errorf("token was cached")
+					}
+					return
+				}
+				time.Sleep(tc.cachedFor - time.Second)
+				if got, _ := fetch(s, apiURI, actorID); got != first {
+					t.Errorf("before refresh: got %q, want cached %q", got, first)
+				}
+				time.Sleep(time.Second)
+				if got, _ := fetch(s, apiURI, actorID); got == first {
+					t.Errorf("at refresh point: got cached token %q", got)
+				}
+			})
+		})
+	}
+}
+
+func TestFetchSecretCachesPerActor(t *testing.T) {
+	ex := &fakeExchanger{lifetime: time.Hour}
+	s := newServer(t, &fakeMinter{}, ex)
+	for _, actor := range []string{actorID, "spiffe://substrate-actor.local/actor/team-a/agent-2", actorID} {
+		if _, err := fetch(s, apiURI, actor); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := ex.calls.Load(); got != 2 {
+		t.Errorf("exchanges = %d, want 2 (one per actor)", got)
+	}
+}
+
+func TestFetchSecretSingleflight(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ex := &fakeExchanger{lifetime: time.Hour, block: make(chan struct{})}
+		s := newServer(t, &fakeMinter{}, ex)
+
+		const n = 8
+		var wg sync.WaitGroup
+		sources := make([]string, n)
+		for i := range n {
+			wg.Go(func() {
+				var err error
+				if _, sources[i], err = s.fetch(context.Background(), actorID, "api"); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		synctest.Wait()
+		close(ex.block)
+		wg.Wait()
+
+		if got := ex.calls.Load(); got != 1 {
+			t.Errorf("exchanges = %d, want 1", got)
+		}
+		for _, src := range sources {
+			if src != "shared" {
+				t.Errorf("sources = %q, want all shared", sources)
+				break
+			}
+		}
+	})
+}
+
+func TestFetchSecretCallerCancelDoesNotAbortExchange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ex := &fakeExchanger{lifetime: time.Hour, block: make(chan struct{})}
+		s := newServer(t, &fakeMinter{}, ex)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		var src string
+		var err error
+		done := make(chan struct{})
+		go func() {
+			_, src, err = s.fetch(ctx, actorID, "api")
+			close(done)
+		}()
+		synctest.Wait()
+		cancel()
+		<-done
+		if status.Code(err) != codes.Canceled || src != "abandoned" {
+			t.Errorf("canceled caller got %q, %v; want abandoned, Canceled", src, err)
+		}
+		close(ex.block)
+		synctest.Wait()
+		if _, src, err := s.fetch(context.Background(), actorID, "api"); err != nil || src != "hit" || ex.calls.Load() != 1 {
+			t.Errorf("retry: source=%q err=%v exchanges=%d, want a cached token", src, err, ex.calls.Load())
+		}
+	})
+}
+
+func TestFetchSecretServerContextBoundsExchange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		ex := &fakeExchanger{lifetime: time.Hour, block: make(chan struct{})}
+		s := NewServer(ctx, testConfig(t), &fakeMinter{}, ex, 0)
+		go cancel()
+		if _, _, err := s.fetch(context.Background(), actorID, "api"); status.Code(err) != codes.Canceled {
+			t.Errorf("got %v, want Canceled when the server context ends", err)
 		}
 	})
 }
@@ -268,10 +393,12 @@ func TestFetchSecretEndToEnd(t *testing.T) {
 	// test server after parsing.
 	p, _ := cfg.Profile("api")
 	p.TokenURL = sts.URL + "/token"
-	s := NewServer(cfg, ControlMinter{Client: startControl(t, control)}, newExchanger(t, sts), 0)
+	s := NewServer(context.Background(), cfg, ControlMinter{Client: startControl(t, control)}, newExchanger(t, sts), 0)
 
-	if got, err := fetch(s, apiURI, actorID); err != nil || got != "exchanged-token" {
-		t.Fatalf("got %q, %v", got, err)
+	for range 2 {
+		if got, err := fetch(s, apiURI, actorID); err != nil || got != "exchanged-token" {
+			t.Fatalf("got %q, %v", got, err)
+		}
 	}
 	for k, want := range map[string]string{"subject_token": "actor-jwt-for-agent-1", "audience": audience, "scope": "read"} {
 		if got := form.Get(k); got != want {
@@ -280,6 +407,9 @@ func TestFetchSecretEndToEnd(t *testing.T) {
 	}
 	control.mu.Lock()
 	defer control.mu.Unlock()
+	if len(control.reqs) != 1 {
+		t.Errorf("minted %d times, want 1 (the repeat is cached)", len(control.reqs))
+	}
 	req := control.reqs[0]
 	if req.GetActor().GetAtespace() != "team-a" || req.GetActor().GetName() != "agent-1" ||
 		len(req.GetAudiences()) != 1 || req.GetAudiences()[0] != audience || req.GetExpirationSeconds() != 300 {

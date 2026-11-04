@@ -28,8 +28,10 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/cache"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
@@ -48,6 +50,14 @@ const (
 	// DefaultFetchTimeout leaves headroom under the egress gateway's 4s
 	// credential injection timeout.
 	DefaultFetchTimeout = 3 * time.Second
+
+	// minReuseMargin is the least lifetime left at which a token stops being
+	// reused.
+	minReuseMargin = 30 * time.Second
+	// unknownExpiryReuse is how long a token without expires_in is reused.
+	unknownExpiryReuse = 60 * time.Second
+	// maxReuse bounds how long a token is served from the cache.
+	maxReuse = time.Hour
 )
 
 // Minter mints an actor JWT bound to audience.
@@ -94,71 +104,115 @@ func (m ControlMinter) MintActorJWT(ctx context.Context, atespace, name, audienc
 type Server struct {
 	credprovider.UnimplementedCredentialProviderServer
 
+	ctx          context.Context
 	cfg          *config.Config
 	minter       Minter
 	exchanger    Exchanger
 	fetchTimeout time.Duration
-	now          func() time.Time
+
+	// tokens maps a cacheKey to an access token until it stops being reused.
+	tokens *cache.Expiring
+	// group collapses concurrent exchanges of one token into a single call.
+	group singleflight.Group
 }
 
-// NewServer returns a Server for cfg. A fetchTimeout of zero means
-// DefaultFetchTimeout.
-func NewServer(cfg *config.Config, minter Minter, exchanger Exchanger, fetchTimeout time.Duration) *Server {
+type cacheKey struct{ atespace, name, profile string }
+
+func (k cacheKey) String() string { return k.atespace + "/" + k.name + "/" + k.profile }
+
+// NewServer returns a Server for cfg. Exchanges run under ctx, not the
+// caller's, so a caller giving up doesn't abort one that others share; cancel
+// ctx on shutdown. A fetchTimeout of zero means DefaultFetchTimeout.
+func NewServer(ctx context.Context, cfg *config.Config, minter Minter, exchanger Exchanger, fetchTimeout time.Duration) *Server {
 	if fetchTimeout <= 0 {
 		fetchTimeout = DefaultFetchTimeout
 	}
 	return &Server{
+		ctx:          ctx,
 		cfg:          cfg,
 		minter:       minter,
 		exchanger:    exchanger,
 		fetchTimeout: fetchTimeout,
-		now:          time.Now,
+		tokens:       cache.NewExpiring(),
 	}
 }
 
 // FetchSecret returns the access token for the profile named in the URI,
 // issued to the requesting actor.
 func (s *Server) FetchSecret(ctx context.Context, req *credprovider.FetchSecretRequest) (*credprovider.FetchSecretResponse, error) {
-	start := s.now()
+	start := time.Now()
 	profileName, err := s.parseURI(req.GetUri())
+	source := ""
 	var tok string
 	if err == nil {
-		tok, err = s.fetch(ctx, req.GetActorSpiffeId(), profileName)
+		tok, source, err = s.fetch(ctx, req.GetActorSpiffeId(), profileName)
 	}
 	attrs := []any{
 		slog.String("actor", req.GetActorSpiffeId()),
 		slog.String("profile", profileName),
+		slog.String("cache", source),
 		slog.String("outcome", status.Code(err).String()),
-		slog.Duration("latency", s.now().Sub(start)),
+		slog.Duration("latency", time.Since(start)),
 	}
-	if err != nil {
+	switch {
+	case err != nil:
 		slog.WarnContext(ctx, "token exchange failed", append(attrs, slog.String("err", status.Convert(err).Message()))...)
 		return nil, err
+	case source == "miss":
+		slog.InfoContext(ctx, "token exchange", attrs...)
+	default:
+		slog.DebugContext(ctx, "token exchange", attrs...)
 	}
-	slog.InfoContext(ctx, "token exchange", attrs...)
 	return &credprovider.FetchSecretResponse{OpaqueBytes: []byte(tok)}, nil
 }
 
-// fetch authorizes the request, mints the actor's JWT and exchanges it.
-func (s *Server) fetch(ctx context.Context, actorID, profileName string) (string, error) {
+// fetch authorizes the request and returns a token and where it came from:
+// the cache ("hit"), a new exchange ("miss"), one already in flight
+// ("shared"), or none because the caller gave up ("abandoned").
+func (s *Server) fetch(ctx context.Context, actorID, profileName string) (string, string, error) {
 	atespace, name, err := parseActorSPIFFEID(actorID)
 	if err != nil {
-		return "", status.Errorf(codes.PermissionDenied, "invalid actor SPIFFE ID: %v", err)
+		return "", "", status.Errorf(codes.PermissionDenied, "invalid actor SPIFFE ID: %v", err)
 	}
 	if !s.cfg.Allowed(atespace, profileName) {
-		return "", status.Errorf(codes.PermissionDenied, "atespace %q is not granted profile %q", atespace, profileName)
+		return "", "", status.Errorf(codes.PermissionDenied, "atespace %q is not granted profile %q", atespace, profileName)
 	}
 	profile, ok := s.cfg.Profile(profileName)
 	if !ok {
-		return "", status.Errorf(codes.Internal, "granted profile %q is not configured", profileName)
+		return "", "", status.Errorf(codes.Internal, "granted profile %q is not configured", profileName)
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.fetchTimeout)
-	defer cancel()
-	t, err := s.exchange(ctx, atespace, name, profile)
-	if err != nil {
-		return "", err
+
+	key := cacheKey{atespace, name, profileName}
+	if tok, ok := s.cached(key); ok {
+		return tok, "hit", nil
 	}
-	return t.AccessToken, nil
+
+	ch := s.group.DoChan(key.String(), func() (any, error) {
+		if tok, ok := s.cached(key); ok {
+			return tok, nil
+		}
+		fctx, cancel := context.WithTimeout(s.ctx, s.fetchTimeout)
+		defer cancel()
+		t, err := s.exchange(fctx, atespace, name, profile)
+		if err != nil {
+			return nil, err
+		}
+		s.store(key, t)
+		return t.AccessToken, nil
+	})
+	select {
+	case <-ctx.Done():
+		return "", "abandoned", status.FromContextError(ctx.Err()).Err()
+	case r := <-ch:
+		source := "miss"
+		if r.Shared {
+			source = "shared"
+		}
+		if r.Err != nil {
+			return "", source, r.Err
+		}
+		return r.Val.(string), source, nil
+	}
 }
 
 func (s *Server) exchange(ctx context.Context, atespace, name string, p *config.Profile) (tokenexchange.Token, error) {
@@ -167,6 +221,30 @@ func (s *Server) exchange(ctx context.Context, atespace, name string, p *config.
 		return tokenexchange.Token{}, err
 	}
 	return s.exchanger.Exchange(ctx, p.TokenURL, jwt, p.Audience, p.Scopes)
+}
+
+func (s *Server) cached(key cacheKey) (string, bool) {
+	v, ok := s.tokens.Get(key)
+	tok, _ := v.(string)
+	return tok, ok
+}
+
+// store caches t for reuseFor(t), if that is positive.
+func (s *Server) store(key cacheKey, t tokenexchange.Token) {
+	if reuse := reuseFor(t); reuse > 0 {
+		s.tokens.Set(key, t.AccessToken, reuse)
+	}
+}
+
+// reuseFor is how long token is served from the cache: until a third of its
+// lifetime, or 30 seconds, remains, whichever comes first, and at most
+// maxReuse.
+func reuseFor(token tokenexchange.Token) time.Duration {
+	if token.ExpiresAt.IsZero() {
+		return unknownExpiryReuse
+	}
+	lifetime := time.Until(token.ExpiresAt)
+	return min(lifetime-max(lifetime/3, minReuseMargin), maxReuse)
 }
 
 // parseURI returns the profile named by an
