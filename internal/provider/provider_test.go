@@ -131,10 +131,15 @@ func TestParseActorSPIFFEID(t *testing.T) {
 type fakeMinter struct {
 	calls atomic.Int32
 	err   error
+	block bool
 }
 
-func (m *fakeMinter) MintActorJWT(_ context.Context, atespace, name, aud string) (string, error) {
+func (m *fakeMinter) MintActorJWT(ctx context.Context, atespace, name, aud string) (string, error) {
 	m.calls.Add(1)
+	if m.block {
+		<-ctx.Done()
+		return "", status.FromContextError(ctx.Err()).Err()
+	}
 	if m.err != nil {
 		return "", m.err
 	}
@@ -326,6 +331,19 @@ func TestFetchSecretTimeout(t *testing.T) {
 		}
 		if got := time.Since(start); got != time.Second {
 			t.Errorf("exchange gave up after %v, want the 1s fetch timeout", got)
+		}
+	})
+}
+
+func TestFetchSecretMintTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newServer(t, &fakeMinter{block: true}, &fakeExchanger{})
+		start := time.Now()
+		if _, _, err := s.fetch(context.Background(), actorID, "api"); status.Code(err) != codes.DeadlineExceeded {
+			t.Errorf("got %v, want DeadlineExceeded", err)
+		}
+		if got := time.Since(start); got != maxMintTimeout {
+			t.Errorf("mint gave up after %v, want %v", got, maxMintTimeout)
 		}
 	})
 }

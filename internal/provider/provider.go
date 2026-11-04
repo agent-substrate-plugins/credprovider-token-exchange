@@ -50,6 +50,7 @@ const (
 	// DefaultFetchTimeout leaves headroom under the egress gateway's 4s
 	// credential injection timeout.
 	DefaultFetchTimeout = 3 * time.Second
+	maxMintTimeout      = 2 * time.Second
 
 	// minReuseMargin is the least lifetime left at which a token stops being
 	// reused.
@@ -202,6 +203,7 @@ func (s *Server) fetch(ctx context.Context, actorID, profileName string) (string
 	})
 	select {
 	case <-ctx.Done():
+		go logAbandoned(ch, key)
 		return "", "abandoned", status.FromContextError(ctx.Err()).Err()
 	case r := <-ch:
 		source := "miss"
@@ -215,8 +217,18 @@ func (s *Server) fetch(ctx context.Context, actorID, profileName string) (string
 	}
 }
 
+// logAbandoned logs the outcome of an exchange whose caller gave up, which
+// FetchSecret could not report.
+func logAbandoned(ch <-chan singleflight.Result, key cacheKey) {
+	if r := <-ch; r.Err != nil {
+		slog.Warn("abandoned token exchange failed", slog.String("key", key.String()), slog.String("err", status.Convert(r.Err).Message()))
+	}
+}
+
 func (s *Server) exchange(ctx context.Context, atespace, name string, p *config.Profile) (tokenexchange.Token, error) {
-	jwt, err := s.minter.MintActorJWT(ctx, atespace, name, p.SubjectTokenAudience)
+	mctx, cancel := context.WithTimeout(ctx, maxMintTimeout)
+	defer cancel()
+	jwt, err := s.minter.MintActorJWT(mctx, atespace, name, p.SubjectTokenAudience)
 	if err != nil {
 		return tokenexchange.Token{}, err
 	}
