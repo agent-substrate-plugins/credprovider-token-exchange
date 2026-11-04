@@ -23,10 +23,14 @@ data:
   config.yaml: |
     providerName: sts
     profiles:
+    - name: example
+      tokenUrl: https://sts.example.com/token
+      audience: https://api.example.com
+      scopes: ["read"]
     - name: gcp
       tokenUrl: https://sts.googleapis.com/v1/token
       audience: //iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER
       scopes: ["https://www.googleapis.com/auth/cloud-platform"]
     policy:
       atespaces:
-        team-a: ["gcp"]
+        team-a: ["example", "gcp"]

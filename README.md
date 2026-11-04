@@ -5,7 +5,7 @@
 A [substrate](https://github.com/agent-substrate/substrate) credential provider
 that exchanges an actor's Substrate-minted JWT for an access token at an
 [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) token endpoint, such as
-Google Cloud STS, the only endpoint supported so far. It implements substrate's `CredentialProvider` gRPC API
+Google Cloud STS. It implements substrate's `CredentialProvider` gRPC API
 (`api/credprovider/v1`) for egress credential injection.
 
 ## How it works
@@ -15,11 +15,14 @@ For a credential URI naming a profile, the provider:
 1. refuses the request unless the policy grants the profile to the actor's
    atespace;
 2. mints the actor's JWT through ate-api-server's `Control.MintActorJwt`, with
-   the profile's `audience` as its `aud`;
+   the profile's `subjectTokenAudience` as its `aud`;
 3. exchanges it at the profile's `tokenUrl` for an access token;
 4. caches the token per (atespace, actor, profile) until its expiry minus
    max(lifetime/3, 30s), for at most an hour, or for 60s if the endpoint
    returned no `expires_in`, and returns it to the egress gateway.
+
+The token endpoint must accept a JWT `subject_token` without client
+authentication and return a bearer access token.
 
 ## Credential URIs
 
@@ -40,9 +43,10 @@ Deployment after changing it.
 | --- | --- |
 | `providerName` | Host of the `ate-secret://` URIs the provider serves; a lowercase DNS-1123 subdomain |
 | `profiles[].name` | Referenced from the credential URI and the policy |
-| `profiles[].tokenUrl` | Must be `https://sts.googleapis.com/v1/token` |
-| `profiles[].audience` | RFC 8693 `audience` and the minted actor JWT's `aud`: the workload identity pool provider's resource name |
-| `profiles[].scopes` | RFC 8693 `scope`; at least one |
+| `profiles[].tokenUrl` | The token endpoint: https, a DNS host name, no query or fragment |
+| `profiles[].audience` | RFC 8693 `audience`, omitted if empty |
+| `profiles[].subjectTokenAudience` | `aud` of the minted actor JWT; defaults to `audience` |
+| `profiles[].scopes` | RFC 8693 `scope`, omitted if empty |
 | `policy.atespaces` | Profiles each atespace may use; an atespace not listed gets none |
 
 ## Security model
@@ -59,9 +63,11 @@ Deployment after changing it.
 - **Tokens outlive changes made after they're cached.** A cached token is
   served until its refresh time even if the token endpoint revokes the grant,
   or the actor is deleted and another is created with the same name.
-- **The provider calls only Google Cloud STS.** It ignores `HTTP(S)_PROXY`,
-  and `config/networkpolicy.yaml` allows egress only to ate-api-server, DNS
-  and public addresses on port 443.
+- **Token endpoints must be public.** The provider ignores `HTTP(S)_PROXY` and
+  refuses to connect to loopback, link-local (including cloud metadata),
+  multicast and unspecified addresses, and to private ones unless
+  `--allow-private-token-endpoints` is set. `config/networkpolicy.yaml` allows
+  egress only to ate-api-server, kube-dns and public addresses on port 443.
 - **The token endpoint decides the rest.** What a token can reach is whatever
   the endpoint's issuer grants the actor's federated identity.
 
@@ -135,8 +141,9 @@ ConfigMap in place.
 | `--ateapi-ca-file` | required | Trust bundle ate-api-server's certificate must chain to |
 | `--ateapi-client-cert` | required | Credential bundle presented to ate-api-server |
 | `--ateapi-server-name` | required | DNS name ate-api-server's certificate must carry |
-| `--token-exchange-ca-file` | none | PEM certificates trusted for token endpoints, beside the system roots; read at startup |
 | `--fetch-timeout` | `3s` | Time limit for minting and exchanging one token; keep it under the gateway's 4s credential injection timeout |
+| `--token-exchange-ca-file` | none | PEM certificates trusted for token endpoints, beside the system roots; read at startup |
+| `--allow-private-token-endpoints` | `false` | Allow token endpoints at RFC 1918 and RFC 4193 addresses |
 | `--log-level` | `info` | `debug`, `info`, `warn` or `error` |
 | `--drain-grace` | `5s` | How long in-flight calls may finish on shutdown |
 

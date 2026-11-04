@@ -16,14 +16,7 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
-	"encoding/pem"
 	"net"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +25,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -47,26 +41,28 @@ import (
 
 const (
 	actorID  = "spiffe://substrate-actor.local/actor/team-a/agent-1"
-	audience = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/q"
+	audience = "https://api.example.com"
 	apiURI   = "ate-secret://sts/token-exchange/api"
 )
 
-func testConfig(t *testing.T) *config.Config {
+func testConfig(t *testing.T, tokenURL string) *config.Config {
 	t.Helper()
 	cfg, err := config.Parse([]byte(`
 providerName: sts
 profiles:
 - name: api
-  tokenUrl: https://sts.googleapis.com/v1/token
+  tokenUrl: ` + tokenURL + `
   audience: ` + audience + `
   scopes: ["read"]
+- name: sts-aud
+  tokenUrl: ` + tokenURL + `
+  subjectTokenAudience: https://sts.example.com
 - name: other
-  tokenUrl: https://sts.googleapis.com/v1/token
+  tokenUrl: ` + tokenURL + `
   audience: ` + audience + `
-  scopes: ["read"]
 policy:
   atespaces:
-    team-a: ["api"]
+    team-a: ["api", "sts-aud"]
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -76,13 +72,18 @@ policy:
 
 func newServer(t *testing.T, m Minter, e Exchanger) *Server {
 	t.Helper()
-	return NewServer(context.Background(), testConfig(t), m, e, 0)
+	return NewServer(context.Background(), testConfig(t, "https://sts.example.com"), m, e, 0)
 }
 
 func TestParseURI(t *testing.T) {
 	s := newServer(t, nil, nil)
-	if got, err := s.parseURI(apiURI); err != nil || got != "api" {
-		t.Errorf("parseURI(%q) = %q, %v; want api", apiURI, got, err)
+	for uri, want := range map[string]string{
+		apiURI: "api",
+		"ate-secret://sts/token-exchange/sts-aud": "sts-aud",
+	} {
+		if got, err := s.parseURI(uri); err != nil || got != want {
+			t.Errorf("parseURI(%q) = %q, %v; want %q", uri, got, err, want)
+		}
 	}
 	for _, uri := range []string{
 		"",
@@ -191,20 +192,6 @@ func TestFetchSecretPolicy(t *testing.T) {
 	if got := m.calls.Load(); got != 1 {
 		t.Errorf("minter called %d times, want 1", got)
 	}
-}
-
-func TestFetchSecretTimeout(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ex := &fakeExchanger{lifetime: time.Hour, block: make(chan struct{})}
-		s := NewServer(context.Background(), testConfig(t), &fakeMinter{}, ex, time.Second)
-		start := time.Now()
-		if _, err := fetch(s, apiURI, actorID); status.Code(err) != codes.DeadlineExceeded {
-			t.Errorf("got %v, want DeadlineExceeded", err)
-		}
-		if got := time.Since(start); got != time.Second {
-			t.Errorf("exchange gave up after %v, want the 1s fetch timeout", got)
-		}
-	})
 }
 
 func TestFetchSecretCacheLifetime(t *testing.T) {
@@ -321,10 +308,24 @@ func TestFetchSecretServerContextBoundsExchange(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		ex := &fakeExchanger{lifetime: time.Hour, block: make(chan struct{})}
-		s := NewServer(ctx, testConfig(t), &fakeMinter{}, ex, 0)
+		s := NewServer(ctx, testConfig(t, "https://sts.example.com"), &fakeMinter{}, ex, 0)
 		go cancel()
 		if _, _, err := s.fetch(context.Background(), actorID, "api"); status.Code(err) != codes.Canceled {
 			t.Errorf("got %v, want Canceled when the server context ends", err)
+		}
+	})
+}
+
+func TestFetchSecretTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ex := &fakeExchanger{lifetime: time.Hour, block: make(chan struct{})}
+		s := NewServer(context.Background(), testConfig(t, "https://sts.example.com"), &fakeMinter{}, ex, time.Second)
+		start := time.Now()
+		if _, _, err := s.fetch(context.Background(), actorID, "api"); status.Code(err) != codes.DeadlineExceeded {
+			t.Errorf("got %v, want DeadlineExceeded", err)
+		}
+		if got := time.Since(start); got != time.Second {
+			t.Errorf("exchange gave up after %v, want the 1s fetch timeout", got)
 		}
 	})
 }
@@ -364,56 +365,53 @@ func startControl(t *testing.T, f *fakeControl) ateapi.ControlClient {
 	return ateapi.NewControlClient(conn)
 }
 
-// newExchanger returns a token exchange client that trusts srv's certificate.
-func newExchanger(t *testing.T, srv *httptest.Server) *tokenexchange.Client {
-	t.Helper()
-	caFile := filepath.Join(t.TempDir(), "ca.crt")
-	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c, err := tokenexchange.New(caFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return c
+// recordingExchanger records the exchanges it is asked for.
+type recordingExchanger struct {
+	mu    sync.Mutex
+	calls []exchangeCall
+}
+
+type exchangeCall struct {
+	tokenURL, subjectToken, audience string
+	scopes                           []string
+}
+
+func (e *recordingExchanger) Exchange(_ context.Context, tokenURL, subjectToken, audience string, scopes []string) (tokenexchange.Token, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls = append(e.calls, exchangeCall{tokenURL, subjectToken, audience, scopes})
+	return tokenexchange.Token{AccessToken: "exchanged-token", ExpiresAt: time.Now().Add(time.Hour)}, nil
 }
 
 func TestFetchSecretEndToEnd(t *testing.T) {
 	control := &fakeControl{}
-	var form url.Values
-	sts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		form = r.PostForm
-		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "exchanged-token", "token_type": "Bearer", "expires_in": 3600})
-	}))
-	t.Cleanup(sts.Close)
+	ex := &recordingExchanger{}
+	s := NewServer(context.Background(), testConfig(t, "https://sts.example.com/token"), ControlMinter{Client: startControl(t, control)}, ex, 0)
 
-	cfg := testConfig(t)
-	// The config accepts only Google Cloud STS, so point the profile at the
-	// test server after parsing.
-	p, _ := cfg.Profile("api")
-	p.TokenURL = sts.URL + "/token"
-	s := NewServer(context.Background(), cfg, ControlMinter{Client: startControl(t, control)}, newExchanger(t, sts), 0)
-
-	for range 2 {
-		if got, err := fetch(s, apiURI, actorID); err != nil || got != "exchanged-token" {
-			t.Fatalf("got %q, %v", got, err)
+	for _, uri := range []string{apiURI, "ate-secret://sts/token-exchange/sts-aud", apiURI} {
+		if got, err := fetch(s, uri, actorID); err != nil || got != "exchanged-token" {
+			t.Fatalf("%s: got %q, %v", uri, got, err)
 		}
 	}
-	for k, want := range map[string]string{"subject_token": "actor-jwt-for-agent-1", "audience": audience, "scope": "read"} {
-		if got := form.Get(k); got != want {
-			t.Errorf("form %s = %q, want %q", k, got, want)
-		}
+
+	ex.mu.Lock()
+	defer ex.mu.Unlock()
+	want := []exchangeCall{
+		{"https://sts.example.com/token", "actor-jwt-for-agent-1", audience, []string{"read"}},
+		{"https://sts.example.com/token", "actor-jwt-for-agent-1", "", nil},
 	}
+	if diff := cmp.Diff(want, ex.calls, cmp.AllowUnexported(exchangeCall{})); diff != "" {
+		t.Errorf("exchanges (-want +got), the repeat being cached:\n%s", diff)
+	}
+
 	control.mu.Lock()
 	defer control.mu.Unlock()
-	if len(control.reqs) != 1 {
-		t.Errorf("minted %d times, want 1 (the repeat is cached)", len(control.reqs))
-	}
-	req := control.reqs[0]
-	if req.GetActor().GetAtespace() != "team-a" || req.GetActor().GetName() != "agent-1" ||
-		len(req.GetAudiences()) != 1 || req.GetAudiences()[0] != audience || req.GetExpirationSeconds() != 300 {
-		t.Errorf("MintActorJwt request = %v", req)
+	for i, want := range []string{audience, "https://sts.example.com"} {
+		req := control.reqs[i]
+		if req.GetActor().GetAtespace() != "team-a" || req.GetActor().GetName() != "agent-1" ||
+			len(req.GetAudiences()) != 1 || req.GetAudiences()[0] != want || req.GetExpirationSeconds() != 300 {
+			t.Errorf("MintActorJwt request %d = %v, want audience %q", i, req, want)
+		}
 	}
 }
 

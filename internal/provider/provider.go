@@ -216,7 +216,7 @@ func (s *Server) fetch(ctx context.Context, actorID, profileName string) (string
 }
 
 func (s *Server) exchange(ctx context.Context, atespace, name string, p *config.Profile) (tokenexchange.Token, error) {
-	jwt, err := s.minter.MintActorJWT(ctx, atespace, name, p.Audience)
+	jwt, err := s.minter.MintActorJWT(ctx, atespace, name, p.SubjectTokenAudience)
 	if err != nil {
 		return tokenexchange.Token{}, err
 	}

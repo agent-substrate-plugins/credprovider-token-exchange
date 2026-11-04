@@ -27,11 +27,11 @@ profiles:
 - name: gcp
   tokenUrl: https://sts.googleapis.com/v1/token
   audience: //iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/p/providers/q
+  subjectTokenAudience: https://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/p/providers/q
   scopes: ["https://www.googleapis.com/auth/cloud-platform"]
 - name: other
-  tokenUrl: https://sts.googleapis.com/v1/token
-  audience: //iam.googleapis.com/projects/456/locations/global/workloadIdentityPools/p/providers/q
-  scopes: ["https://www.googleapis.com/auth/devstorage.read_only"]
+  tokenUrl: https://sts.example.com/token
+  audience: https://api.example.com
 policy:
   atespaces:
     team-a: ["gcp", "other"]
@@ -43,8 +43,19 @@ func TestParseValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if _, ok := c.Profile("gcp"); !ok {
+	p, ok := c.Profile("gcp")
+	if !ok {
 		t.Fatal("profile gcp not found")
+	}
+	if want := "https://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/p/providers/q"; p.SubjectTokenAudience != want {
+		t.Errorf("explicit SubjectTokenAudience = %q, want %q", p.SubjectTokenAudience, want)
+	}
+	p, _ = c.Profile("other")
+	if p.SubjectTokenAudience != "https://api.example.com" {
+		t.Errorf("default SubjectTokenAudience = %q, want the audience", p.SubjectTokenAudience)
+	}
+	if len(p.Scopes) != 0 {
+		t.Errorf("Scopes = %q, want none", p.Scopes)
 	}
 	for _, tc := range []struct {
 		atespace, profile string
@@ -62,29 +73,47 @@ func TestParseValid(t *testing.T) {
 	}
 }
 
+func TestParseSubjectTokenAudienceOnly(t *testing.T) {
+	c, err := Parse([]byte(strings.Replace(valid, "  audience: https://api.example.com", "  subjectTokenAudience: https://sts.example.com", 1)))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p, _ := c.Profile("other"); p.Audience != "" || p.SubjectTokenAudience != "https://sts.example.com" {
+		t.Errorf("got Audience %q, SubjectTokenAudience %q", p.Audience, p.SubjectTokenAudience)
+	}
+}
+
 func TestParseInvalid(t *testing.T) {
-	const otherAudience = "  audience: //iam.googleapis.com/projects/456/locations/global/workloadIdentityPools/p/providers/q"
-	const otherScopes = `scopes: ["https://www.googleapis.com/auth/devstorage.read_only"]`
 	for name, tc := range map[string]struct {
 		from, to, wantErr string
 	}{
-		"unknown field":        {"providerName:", "bogus: 1\nproviderName:", "unknown field"},
-		"empty provider":       {"providerName: token-exchange", "providerName: ''", "providerName"},
-		"provider with path":   {"providerName: token-exchange", "providerName: a/b", "providerName"},
-		"uppercase provider":   {"providerName: token-exchange", "providerName: Token-Exchange", "providerName"},
-		"provider with port":   {"providerName: token-exchange", "providerName: sts:443", "providerName"},
-		"other token url":      {"- name: other\n  tokenUrl: https://sts.googleapis.com/v1/token", "- name: other\n  tokenUrl: https://sts.example.com/token", "must be https://sts.googleapis.com/v1/token"},
-		"bad profile name":     {"- name: gcp\n", "- name: GCP\n", "DNS label"},
-		"duplicate profile":    {"- name: other", "- name: gcp", "duplicate"},
-		"unknown policy ref":   {`team-b: ["gcp"]`, `team-b: ["nope"]`, "unknown profile"},
-		"bad atespace":         {"team-b:", "Team_B:", "atespace"},
-		"no audience":          {otherAudience + "\n", "", "audience is required"},
-		"long audience":        {otherAudience, "  audience: //" + strings.Repeat("a", 600), "audience is required"},
-		"no scopes":            {otherScopes, "scopes: []", "at least one scope"},
-		"scope with space":     {otherScopes, `scopes: ["a b"]`, "invalid scope"},
-		"scope with quote":     {otherScopes, `scopes: ['a"b']`, "invalid scope"},
-		"scope with backslash": {otherScopes, `scopes: ['a\b']`, "invalid scope"},
-		"empty scope":          {otherScopes, `scopes: [""]`, "invalid scope"},
+		"unknown field":          {"providerName:", "bogus: 1\nproviderName:", "unknown field"},
+		"removed serviceAccount": {"  audience: https://api.example.com", "  audience: https://api.example.com\n  serviceAccount: sa@p.iam.gserviceaccount.com", "unknown field"},
+		"empty provider":         {"providerName: token-exchange", "providerName: ''", "providerName"},
+		"provider with path":     {"providerName: token-exchange", "providerName: a/b", "providerName"},
+		"http token url":         {"tokenUrl: https://sts.example.com", "tokenUrl: http://sts.example.com", "https URL"},
+		"bad profile name":       {"- name: gcp\n", "- name: GCP\n", "DNS label"},
+		"duplicate profile":      {"- name: other", "- name: gcp", "duplicate"},
+		"unknown policy ref":     {`team-b: ["gcp"]`, `team-b: ["nope"]`, "unknown profile"},
+		"bad atespace":           {"team-b:", "Team_B:", "atespace"},
+		"no audience":            {"  audience: https://api.example.com\n", "", "audience or subjectTokenAudience"},
+		"bad scope":              {`scopes: ["https://www.googleapis.com/auth/cloud-platform"]`, `scopes: ["a b"]`, "invalid scope"},
+		"long audience":          {"  audience: https://api.example.com", "  audience: https://" + strings.Repeat("a", 600), "audience exceeds"},
+		"long subject audience":  {"  audience: https://api.example.com", "  subjectTokenAudience: https://" + strings.Repeat("a", 600), "subjectTokenAudience exceeds"},
+		"uppercase provider":     {"providerName: token-exchange", "providerName: Token-Exchange", "providerName"},
+		"provider with port":     {"providerName: token-exchange", "providerName: sts:443", "providerName"},
+		"token url no host":      {"tokenUrl: https://sts.example.com/token", "tokenUrl: https://:443/token", "DNS-1123"},
+		"token url uppercase":    {"tokenUrl: https://sts.example.com/token", "tokenUrl: https://STS.example.com/token", "DNS-1123"},
+		"token url query":        {"tokenUrl: https://sts.example.com/token", "tokenUrl: https://sts.example.com/token?a=b", "query"},
+		"token url empty query":  {"tokenUrl: https://sts.example.com/token", "tokenUrl: https://sts.example.com/token?", "query"},
+		"token url fragment":     {"tokenUrl: https://sts.example.com/token", "tokenUrl: 'https://sts.example.com/token#'", "fragment"},
+		"token url user":         {"tokenUrl: https://sts.example.com/token", "tokenUrl: https://u@sts.example.com/token", "user"},
+		"token url port 0":       {"tokenUrl: https://sts.example.com/token", "tokenUrl: https://sts.example.com:0/token", "port"},
+		"token url big port":     {"tokenUrl: https://sts.example.com/token", "tokenUrl: https://sts.example.com:99999/token", "port"},
+		"token url empty port":   {"tokenUrl: https://sts.example.com/token", "tokenUrl: https://sts.example.com:/token", "port"},
+		"scope with quote":       {`scopes: ["https://www.googleapis.com/auth/cloud-platform"]`, `scopes: ['a"b']`, "invalid scope"},
+		"scope with backslash":   {`scopes: ["https://www.googleapis.com/auth/cloud-platform"]`, `scopes: ['a\b']`, "invalid scope"},
+		"empty scope":            {`scopes: ["https://www.googleapis.com/auth/cloud-platform"]`, `scopes: [""]`, "invalid scope"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if !strings.Contains(valid, tc.from) {
@@ -101,6 +130,12 @@ func TestParseInvalid(t *testing.T) {
 func TestParseRequiresProfiles(t *testing.T) {
 	if _, err := Parse([]byte("providerName: x\n")); err == nil {
 		t.Error("Parse accepted a config without profiles")
+	}
+}
+
+func TestParseAcceptsPort(t *testing.T) {
+	if _, err := Parse([]byte(strings.Replace(valid, "tokenUrl: https://sts.example.com/token", "tokenUrl: https://sts.example.com:8443/token", 1))); err != nil {
+		t.Errorf("Parse: %v", err)
 	}
 }
 

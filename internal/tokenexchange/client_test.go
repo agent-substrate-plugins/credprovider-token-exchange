@@ -18,8 +18,10 @@ import (
 	"context"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -47,10 +49,12 @@ func newTestServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *C
 	mux.HandleFunc("/token", handler)
 	srv := httptest.NewTLSServer(mux)
 	t.Cleanup(srv.Close)
-	c, err := New(writeCAFile(t, srv))
+	c, err := New(writeCAFile(t, srv), false)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// The test server listens on loopback, which the client refuses.
+	c.httpClient.Transport.(*http.Transport).DialContext = (&net.Dialer{}).DialContext
 	return srv, c
 }
 
@@ -74,9 +78,10 @@ func respond(status int, body string) http.HandlerFunc {
 
 func TestExchangeSendsTokenExchangeForm(t *testing.T) {
 	for _, tt := range []struct {
-		name   string
-		scopes []string
-		want   url.Values
+		name       string
+		noAudience bool
+		scopes     []string
+		want       url.Values
 	}{{
 		name:   "scopes are space-joined",
 		scopes: []string{"https://www.googleapis.com/auth/cloud-platform", "read"},
@@ -86,6 +91,15 @@ func TestExchangeSendsTokenExchangeForm(t *testing.T) {
 			"subject_token_type":   {"urn:ietf:params:oauth:token-type:jwt"},
 			"audience":             {audience},
 			"scope":                {"https://www.googleapis.com/auth/cloud-platform read"},
+			"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
+		},
+	}, {
+		name:       "no audience without one",
+		noAudience: true,
+		want: url.Values{
+			"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
+			"subject_token":        {subjectToken},
+			"subject_token_type":   {"urn:ietf:params:oauth:token-type:jwt"},
 			"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
 		},
 	}, {
@@ -113,7 +127,11 @@ func TestExchangeSendsTokenExchangeForm(t *testing.T) {
 				got = r.PostForm
 				respond(http.StatusOK, `{"access_token":"at","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"Bearer","expires_in":600}`)(w, r)
 			})
-			if _, err := c.Exchange(t.Context(), srv.URL+"/token", subjectToken, audience, tt.scopes); err != nil {
+			aud := audience
+			if tt.noAudience {
+				aud = ""
+			}
+			if _, err := c.Exchange(t.Context(), srv.URL+"/token", subjectToken, aud, tt.scopes); err != nil {
 				t.Fatalf("Exchange: %v", err)
 			}
 			if diff := cmp.Diff(tt.want, got); diff != "" {
@@ -295,10 +313,11 @@ func TestNewTrustsCAFile(t *testing.T) {
 		t.Errorf("Exchange with the server's CA: %v", err)
 	}
 
-	systemOnly, err := New("")
+	systemOnly, err := New("", false)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	systemOnly.httpClient.Transport.(*http.Transport).DialContext = (&net.Dialer{}).DialContext
 	_, err = systemOnly.Exchange(t.Context(), srv.URL+"/token", subjectToken, audience, nil)
 	if got := status.Code(err); got != codes.Unavailable {
 		t.Errorf("Exchange without the server's CA: error = %v (code %v), want code %v", err, got, codes.Unavailable)
@@ -315,7 +334,7 @@ func TestNewRejectsUnusableCAFile(t *testing.T) {
 		"file without a cert": noCerts,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := New(path); err == nil {
+			if _, err := New(path, false); err == nil {
 				t.Errorf("New(%q) succeeded, want an error", path)
 			}
 		})
@@ -331,5 +350,50 @@ func TestClipKeepsUTF8Valid(t *testing.T) {
 		if !utf8.ValidString(got) || len(got) > maxDetailBytes {
 			t.Errorf("clip(%q) = %q (%d bytes), want valid UTF-8 within %d bytes", s, got, len(got), maxDetailBytes)
 		}
+	}
+}
+
+func TestNewRefusesLoopback(t *testing.T) {
+	srv := httptest.NewTLSServer(respond(http.StatusOK, `{"access_token":"at"}`))
+	t.Cleanup(srv.Close)
+	c, err := New(writeCAFile(t, srv), true)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = c.Exchange(t.Context(), srv.URL, subjectToken, audience, nil)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "refused destination address 127.0.0.1") {
+		t.Errorf("Exchange error = %v, want FailedPrecondition refusing 127.0.0.1", err)
+	}
+}
+
+func TestCheckAddr(t *testing.T) {
+	for addr, want := range map[string][2]bool{ // {allowed by default, allowed with allowPrivate}
+		"8.8.8.8":         {true, true},
+		"2001:4860::8888": {true, true},
+		"10.1.2.3":        {false, true},
+		"172.16.0.1":      {false, true},
+		"192.168.1.1":     {false, true},
+		"fd00::1":         {false, true},
+		"127.0.0.1":       {false, false},
+		"::1":             {false, false},
+		"169.254.169.254": {false, false},
+		"fe80::1":         {false, false},
+		"224.0.0.1":       {false, false},
+		"ff02::1":         {false, false},
+		"0.0.0.0":         {false, false},
+		"::":              {false, false},
+	} {
+		ip := netip.MustParseAddr(addr)
+		for i, allowPrivate := range []bool{false, true} {
+			if got := checkAddr(ip, allowPrivate) == nil; got != want[i] {
+				t.Errorf("checkAddr(%s, allowPrivate=%v) allowed = %v, want %v", addr, allowPrivate, got, want[i])
+			}
+		}
+	}
+}
+
+func TestDialControlUnmapsIPv4(t *testing.T) {
+	if err := dialControl(true)("tcp", "[::ffff:127.0.0.1]:443", nil); err == nil {
+		t.Error("dialControl accepted an IPv4-mapped loopback address")
 	}
 }

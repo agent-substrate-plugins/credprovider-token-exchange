@@ -19,18 +19,17 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
 )
 
-const (
-	// maxAudienceLen is MintActorJwtRequest's per-audience length limit.
-	maxAudienceLen = 512
-	// GCPSTSURL is the only token endpoint supported so far.
-	GCPSTSURL = "https://sts.googleapis.com/v1/token"
-)
+// maxAudienceLen is MintActorJwtRequest's per-audience length limit.
+const maxAudienceLen = 512
 
 // Config is the provider's configuration file.
 type Config struct {
@@ -45,14 +44,15 @@ type Config struct {
 
 // Profile is one RFC 8693 token exchange an actor may be granted.
 type Profile struct {
-	Name string `json:"name"`
-	// TokenURL must be GCPSTSURL.
+	Name     string `json:"name"`
 	TokenURL string `json:"tokenUrl"`
-	// Audience is the RFC 8693 audience parameter and the aud of the minted
-	// actor JWT: for Google Cloud, the workload identity pool provider's
-	// resource name.
-	Audience string   `json:"audience"`
-	Scopes   []string `json:"scopes"`
+	// Audience is the RFC 8693 audience parameter, omitted if empty.
+	Audience string `json:"audience,omitempty"`
+	// SubjectTokenAudience is the aud of the minted actor JWT. Defaults to
+	// Audience; at least one of the two is required.
+	SubjectTokenAudience string `json:"subjectTokenAudience,omitempty"`
+	// Scopes is the RFC 8693 scope parameter, omitted if empty.
+	Scopes []string `json:"scopes,omitempty"`
 }
 
 // Policy grants profiles to atespaces. Anything not listed is denied.
@@ -123,18 +123,46 @@ func (p *Profile) validate() error {
 	if len(validation.IsDNS1123Label(p.Name)) != 0 {
 		return fmt.Errorf("name %q must be a DNS label", p.Name)
 	}
-	if p.TokenURL != GCPSTSURL {
-		return fmt.Errorf("profile %q: tokenUrl %q must be %s", p.Name, p.TokenURL, GCPSTSURL)
+	if err := validateTokenURL(p.TokenURL); err != nil {
+		return fmt.Errorf("profile %q: tokenUrl %q: %w", p.Name, p.TokenURL, err)
 	}
-	if p.Audience == "" || len(p.Audience) > maxAudienceLen {
-		return fmt.Errorf("profile %q: audience is required, at most %d bytes", p.Name, maxAudienceLen)
+	if len(p.Audience) > maxAudienceLen {
+		return fmt.Errorf("profile %q: audience exceeds %d bytes", p.Name, maxAudienceLen)
 	}
-	if len(p.Scopes) == 0 {
-		return fmt.Errorf("profile %q: at least one scope is required", p.Name)
+	if p.SubjectTokenAudience == "" {
+		p.SubjectTokenAudience = p.Audience
+	}
+	if p.SubjectTokenAudience == "" {
+		return fmt.Errorf("profile %q: audience or subjectTokenAudience is required", p.Name)
+	}
+	if len(p.SubjectTokenAudience) > maxAudienceLen {
+		return fmt.Errorf("profile %q: subjectTokenAudience exceeds %d bytes", p.Name, maxAudienceLen)
 	}
 	for _, s := range p.Scopes {
 		if !isScopeToken(s) {
 			return fmt.Errorf("profile %q: invalid scope %q", p.Name, s)
+		}
+	}
+	return nil
+}
+
+func validateTokenURL(raw string) error {
+	u, err := url.Parse(raw)
+	switch {
+	case err != nil:
+		return err
+	case u.Scheme != "https":
+		return errors.New("must be an https URL")
+	case u.User != nil, u.RawQuery != "", u.ForceQuery, u.Fragment != "", strings.Contains(raw, "#"):
+		return errors.New("must not have user information, a query or a fragment")
+	case len(validation.IsDNS1123Subdomain(u.Hostname())) != 0:
+		return errors.New("host must be a lowercase DNS-1123 subdomain")
+	case strings.HasSuffix(u.Host, ":"):
+		return errors.New("port must not be empty")
+	}
+	if port := u.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid port %q", port)
 		}
 	}
 	return nil

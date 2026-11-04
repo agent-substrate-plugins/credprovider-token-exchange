@@ -14,7 +14,8 @@
 
 # Ingress only from the egress gateway. Egress only to ate-api-server, DNS on
 # port 53 at any address (node-local caches and cloud resolvers sit outside
-# kube-dns), and public addresses on 443.
+# kube-dns), and public addresses on 443; allow more for a private token
+# endpoint or another port.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

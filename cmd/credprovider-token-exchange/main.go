@@ -57,6 +57,7 @@ var (
 	ateapiClientCert = flag.String("ateapi-client-cert", "", "credential bundle presented to ate-api-server (required)")
 	ateapiServerName = flag.String("ateapi-server-name", "", "DNS name the ate-api-server certificate must carry (required)")
 	tokenExchangeCA  = flag.String("token-exchange-ca-file", "", "PEM certificates trusted for token exchange endpoints, in addition to the system roots. A missing file or one with no certificates fails startup")
+	allowPrivate     = flag.Bool("allow-private-token-endpoints", false, "allow token endpoints at RFC 1918 and RFC 4193 addresses")
 	fetchTimeout     = flag.Duration("fetch-timeout", provider.DefaultFetchTimeout, "time limit for minting and exchanging one token; keep it under the egress gateway's 4s credential injection timeout")
 	logLevel         = flag.String("log-level", "info", "one of debug, info, warn, error")
 	drainGrace       = flag.Duration("drain-grace", 5*time.Second, "how long to wait for in-flight RPCs on shutdown before a hard stop")
@@ -113,7 +114,7 @@ func run(ctx context.Context) error {
 	}
 	slog.Info("loaded config", slog.String("file", *configFile), slog.String("provider_name", cfg.ProviderName), slog.Int("profiles", len(cfg.Profiles)))
 
-	exchanger, err := tokenexchange.New(*tokenExchangeCA)
+	exchanger, err := tokenexchange.New(*tokenExchangeCA, *allowPrivate)
 	if err != nil {
 		return err
 	}

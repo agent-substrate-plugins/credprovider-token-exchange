@@ -24,10 +24,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -47,6 +50,8 @@ const (
 	// overflow.
 	maxExpiresIn = 365 * 24 * 60 * 60
 )
+
+var errRefusedAddr = errors.New("refused destination address")
 
 // deniedErrors are the OAuth error codes that mean the endpoint refused this
 // actor's exchange: invalid_target from RFC 8693 section 2.2.2, the rest from
@@ -72,10 +77,14 @@ type Client struct {
 
 // New returns a Client that trusts the system roots plus the PEM certificates
 // in caFile, when set, which must hold at least one. The client ignores proxy
-// environment variables and does not follow redirects.
-func New(caFile string) (*Client, error) {
+// environment variables, does not follow redirects, and dials only public
+// addresses: never loopback, link-local, multicast or unspecified ones, and
+// private ones only if allowPrivate.
+func New(caFile string, allowPrivate bool) (*Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Control: dialControl(allowPrivate)}
+	transport.DialContext = dialer.DialContext
 	if caFile != "" {
 		certs, err := os.ReadFile(caFile)
 		if err != nil {
@@ -99,17 +108,19 @@ func New(caFile string) (*Client, error) {
 }
 
 // Exchange trades subjectToken, a JWT, for an access token at tokenURL within
-// ctx. Errors carry a gRPC code: PermissionDenied for an OAuth denial,
-// FailedPrecondition for another 4xx or a 3xx, DeadlineExceeded when ctx
-// expires, and Unavailable for 429, 5xx, a failed connection, or an unusable
-// 200 response.
+// ctx, leaving an empty audience out of the request. Errors carry a gRPC code:
+// PermissionDenied for an OAuth denial, FailedPrecondition for another 4xx, a
+// 3xx or a refused address, DeadlineExceeded when ctx expires, and
+// Unavailable for 429, 5xx, a failed connection, or an unusable 200 response.
 func (c *Client) Exchange(ctx context.Context, tokenURL, subjectToken, audience string, scopes []string) (Token, error) {
 	form := url.Values{
 		"grant_type":           {grantTypeTokenExchange},
 		"subject_token":        {subjectToken},
 		"subject_token_type":   {tokenTypeJWT},
-		"audience":             {audience},
 		"requested_token_type": {tokenTypeAccessToken},
+	}
+	if audience != "" {
+		form.Set("audience", audience)
 	}
 	if len(scopes) > 0 {
 		form.Set("scope", strings.Join(scopes, " "))
@@ -123,8 +134,11 @@ func (c *Client) Exchange(ctx context.Context, tokenURL, subjectToken, audience 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		code := codes.Unavailable
-		if errors.Is(err, context.DeadlineExceeded) {
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
 			code = codes.DeadlineExceeded
+		case errors.Is(err, errRefusedAddr):
+			code = codes.FailedPrecondition
 		}
 		return Token{}, status.Errorf(code, "token exchange request: %v", err)
 	}
@@ -151,6 +165,32 @@ func (c *Client) Exchange(ctx context.Context, tokenURL, subjectToken, audience 
 		code = codes.PermissionDenied
 	}
 	return Token{}, status.Errorf(code, "token endpoint returned %d%s", resp.StatusCode, oauthErr.detail())
+}
+
+// dialControl checks each address the dialer connects to, after DNS
+// resolution.
+func dialControl(allowPrivate bool) func(network, address string, _ syscall.RawConn) error {
+	return func(_, address string, _ syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return err
+		}
+		ip, err := netip.ParseAddr(host)
+		if err != nil {
+			return err
+		}
+		return checkAddr(ip.Unmap(), allowPrivate)
+	}
+}
+
+func checkAddr(ip netip.Addr, allowPrivate bool) error {
+	switch {
+	case ip.IsLoopback(), ip.IsLinkLocalUnicast(), ip.IsMulticast(), ip.IsUnspecified():
+		return fmt.Errorf("%w %s", errRefusedAddr, ip)
+	case ip.IsPrivate() && !allowPrivate:
+		return fmt.Errorf("%w %s: private addresses are not allowed", errRefusedAddr, ip)
+	}
+	return nil
 }
 
 // parseToken reads a successful token exchange response.
