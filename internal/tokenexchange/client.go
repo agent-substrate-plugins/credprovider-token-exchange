@@ -21,7 +21,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,6 +38,7 @@ const (
 	grantTypeTokenExchange = "urn:ietf:params:oauth:grant-type:token-exchange"
 	tokenTypeJWT           = "urn:ietf:params:oauth:token-type:jwt"
 	tokenTypeAccessToken   = "urn:ietf:params:oauth:token-type:access_token"
+	tokenTypeBearer        = "Bearer"
 
 	maxResponseBytes = 1 << 20
 	// maxDetailBytes bounds the endpoint-supplied error fields an error carries.
@@ -99,10 +99,10 @@ func New(caFile string) (*Client, error) {
 }
 
 // Exchange trades subjectToken, a JWT, for an access token at tokenURL within
-// ctx. Errors carry a gRPC code: PermissionDenied for an OAuth denial,
-// FailedPrecondition for another 4xx or a 3xx, DeadlineExceeded when ctx
-// expires, and Unavailable for 429, 5xx, a failed connection, or an unusable
-// 200 response.
+// ctx. Errors carry a gRPC code: PermissionDenied for a 403 or an OAuth denial,
+// FailedPrecondition for any other non-200 status below 429, DeadlineExceeded
+// or Canceled when ctx ends before the response is read, and Unavailable for
+// 429, 5xx, a failed connection, or an unusable 200 response.
 func (c *Client) Exchange(ctx context.Context, tokenURL, subjectToken, audience string, scopes []string) (Token, error) {
 	form := url.Values{
 		"grant_type":           {grantTypeTokenExchange},
@@ -122,16 +122,12 @@ func (c *Client) Exchange(ctx context.Context, tokenURL, subjectToken, audience 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		code := codes.Unavailable
-		if errors.Is(err, context.DeadlineExceeded) {
-			code = codes.DeadlineExceeded
-		}
-		return Token{}, status.Errorf(code, "token exchange request: %v", err)
+		return Token{}, transportError(ctx, "token exchange request", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return Token{}, status.Errorf(codes.Unavailable, "reading token exchange response: %v", err)
+		return Token{}, transportError(ctx, "reading token exchange response", err)
 	}
 	if len(body) > maxResponseBytes {
 		return Token{}, status.Errorf(codes.Unavailable, "token exchange response exceeds %d bytes", maxResponseBytes)
@@ -147,10 +143,26 @@ func (c *Client) Exchange(ctx context.Context, tokenURL, subjectToken, audience 
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 		code = codes.Unavailable
+	case resp.StatusCode == http.StatusForbidden:
+		// Some endpoints deny an exchange with 403 rather than a 400
+		// invalid_grant.
+		code = codes.PermissionDenied
 	case (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized) && deniedErrors[oauthErr.Error]:
 		code = codes.PermissionDenied
 	}
 	return Token{}, status.Errorf(code, "token endpoint returned %d%s", resp.StatusCode, oauthErr.detail())
+}
+
+// transportError maps an error from sending the request or reading the
+// response. When ctx has ended, that is the cause, reported as
+// DeadlineExceeded or Canceled; anything else, including a transport timeout
+// while ctx is live, is Unavailable.
+func transportError(ctx context.Context, what string, err error) error {
+	code := codes.Unavailable
+	if ctx.Err() != nil {
+		code = status.FromContextError(ctx.Err()).Code()
+	}
+	return status.Errorf(code, "%s: %v", what, err)
 }
 
 // parseToken reads a successful token exchange response.
@@ -158,6 +170,7 @@ func parseToken(body []byte) (Token, error) {
 	var r struct {
 		AccessToken     string `json:"access_token"`
 		IssuedTokenType string `json:"issued_token_type"`
+		TokenType       string `json:"token_type"`
 		ExpiresIn       *int64 `json:"expires_in"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
@@ -165,6 +178,12 @@ func parseToken(body []byte) (Token, error) {
 	}
 	if r.IssuedTokenType != "" && r.IssuedTokenType != tokenTypeAccessToken {
 		return Token{}, status.Errorf(codes.Unavailable, "token endpoint issued token type %q, want %q", clip(r.IssuedTokenType), tokenTypeAccessToken)
+	}
+	// RFC 8693 section 2.2.1 requires token_type; it is case-insensitive
+	// (RFC 6749 section 7.1). The caller sends the token as a Bearer token, so
+	// refuse any other type, but accept a response that omits it.
+	if r.TokenType != "" && !strings.EqualFold(r.TokenType, tokenTypeBearer) {
+		return Token{}, status.Errorf(codes.Unavailable, "token endpoint issued token_type %q, want %q", clip(r.TokenType), tokenTypeBearer)
 	}
 	if !isAccessToken(r.AccessToken) {
 		return Token{}, status.Error(codes.Unavailable, "token endpoint returned an empty access_token or one with characters outside VSCHAR")
