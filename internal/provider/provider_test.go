@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/pem"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -141,9 +142,10 @@ func (m *fakeMinter) MintActorJWT(_ context.Context, atespace, name, aud string)
 }
 
 type fakeExchanger struct {
-	calls    atomic.Int32
-	lifetime time.Duration // zero means no expiry
-	block    chan struct{}
+	calls     atomic.Int32
+	lifetime  time.Duration // zero means no expiry
+	block     chan struct{}
+	failFirst int32 // this many calls fail with Unavailable
 }
 
 func (e *fakeExchanger) Exchange(ctx context.Context, _, subjectToken, _ string, _ []string) (tokenexchange.Token, error) {
@@ -154,6 +156,9 @@ func (e *fakeExchanger) Exchange(ctx context.Context, _, subjectToken, _ string,
 		case <-ctx.Done():
 			return tokenexchange.Token{}, status.FromContextError(ctx.Err()).Err()
 		}
+	}
+	if n <= e.failFirst {
+		return tokenexchange.Token{}, status.Error(codes.Unavailable, "exchange failed")
 	}
 	t := tokenexchange.Token{AccessToken: subjectToken + "#" + strconv.Itoa(int(n))}
 	if e.lifetime > 0 {
@@ -263,6 +268,8 @@ func TestFetchSecretSingleflight(t *testing.T) {
 		ex := &fakeExchanger{lifetime: time.Hour, block: make(chan struct{})}
 		s := newServer(t, &fakeMinter{}, ex)
 
+		logs := recordLogs(s)
+
 		const n = 8
 		var wg sync.WaitGroup
 		sources := make([]string, n)
@@ -281,11 +288,15 @@ func TestFetchSecretSingleflight(t *testing.T) {
 		if got := ex.calls.Load(); got != 1 {
 			t.Errorf("exchanges = %d, want 1", got)
 		}
+		count := map[string]int{}
 		for _, src := range sources {
-			if src != "shared" {
-				t.Errorf("sources = %q, want all shared", sources)
-				break
-			}
+			count[src]++
+		}
+		if count["miss"] != 1 || count["shared"] != n-1 {
+			t.Errorf("sources = %q, want one miss, the caller that exchanged, and %d shared", sources, n-1)
+		}
+		if got := logs.count(slog.LevelInfo, "token exchange"); got != 1 {
+			t.Errorf("logged %d exchanges at Info, want 1", got)
 		}
 	})
 }
@@ -315,6 +326,211 @@ func TestFetchSecretCallerCancelDoesNotAbortExchange(t *testing.T) {
 			t.Errorf("retry: source=%q err=%v exchanges=%d, want a cached token", src, err, ex.calls.Load())
 		}
 	})
+}
+
+func TestFetchSecretLogsAbandonedExchangeFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ex := &fakeExchanger{lifetime: time.Hour, block: make(chan struct{}), failFirst: 1}
+		s := newServer(t, &fakeMinter{}, ex)
+		logs := recordLogs(s)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error)
+		go func() {
+			_, err := s.FetchSecret(ctx, &credprovider.FetchSecretRequest{Uri: apiURI, ActorSpiffeId: actorID})
+			done <- err
+		}()
+		synctest.Wait()
+		cancel()
+		if err := <-done; status.Code(err) != codes.Canceled {
+			t.Fatalf("canceled caller got %v, want Canceled", err)
+		}
+		if got := logs.count(slog.LevelWarn, "fetch secret failed"); got != 1 {
+			t.Errorf("logged %d abandoned requests at Warn, want 1", got)
+		}
+
+		// Every caller is gone; the exchange now fails.
+		close(ex.block)
+		synctest.Wait()
+		if got := logs.count(slog.LevelWarn, "token exchange failed"); got != 1 {
+			t.Errorf("logged %d failed exchanges at Warn, want 1", got)
+		}
+		if got := logs.count(slog.LevelInfo, "token exchange"); got != 0 {
+			t.Errorf("logged %d exchanges at Info, want 0", got)
+		}
+	})
+}
+
+func TestFetchSecretErrorsAreNotCached(t *testing.T) {
+	t.Run("sequential", func(t *testing.T) {
+		ex := &fakeExchanger{lifetime: time.Hour, failFirst: 1}
+		s := newServer(t, &fakeMinter{}, ex)
+		if _, err := fetch(s, apiURI, actorID); status.Code(err) != codes.Unavailable {
+			t.Fatalf("first fetch: got %v, want Unavailable", err)
+		}
+		if _, err := fetch(s, apiURI, actorID); err != nil {
+			t.Fatalf("second fetch: %v", err)
+		}
+		if got := ex.calls.Load(); got != 2 {
+			t.Errorf("exchanges = %d, want 2 (the failure isn't cached)", got)
+		}
+	})
+	t.Run("waiters on a failing flight", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ex := &fakeExchanger{lifetime: time.Hour, block: make(chan struct{}), failFirst: 1}
+			s := newServer(t, &fakeMinter{}, ex)
+			logs := recordLogs(s)
+
+			const n = 4
+			var wg sync.WaitGroup
+			errs := make([]error, n)
+			for i := range n {
+				wg.Go(func() { _, _, errs[i] = s.fetch(context.Background(), actorID, "api") })
+			}
+			synctest.Wait()
+			close(ex.block)
+			wg.Wait()
+			for i, err := range errs {
+				if status.Code(err) != codes.Unavailable {
+					t.Errorf("waiter %d: got %v, want Unavailable", i, err)
+				}
+			}
+			if got := logs.count(slog.LevelWarn, "token exchange failed"); got != 1 {
+				t.Errorf("logged %d failed exchanges at Warn, want 1", got)
+			}
+			if _, src, err := s.fetch(context.Background(), actorID, "api"); err != nil || src != "miss" || ex.calls.Load() != 2 {
+				t.Errorf("after the failure: source=%q err=%v exchanges=%d, want a new exchange", src, err, ex.calls.Load())
+			}
+		})
+	})
+}
+
+func TestFetchSecretPolicyCheckedOnWarmCache(t *testing.T) {
+	ex := &fakeExchanger{lifetime: time.Hour}
+	s := newServer(t, &fakeMinter{}, ex)
+	if _, err := fetch(s, apiURI, actorID); err != nil {
+		t.Fatal(err)
+	}
+
+	// An actor of the same name in an atespace not granted the profile.
+	if _, err := fetch(s, apiURI, "spiffe://substrate-actor.local/actor/team-b/agent-1"); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("ungranted atespace: got %v, want PermissionDenied", err)
+	}
+
+	// The cached actor itself, once the policy no longer grants the profile.
+	revoked, err := config.Parse([]byte(`
+providerName: sts
+profiles:
+- name: api
+  tokenUrl: https://sts.googleapis.com/v1/token
+  audience: ` + audience + `
+  scopes: ["read"]
+- name: other
+  tokenUrl: https://sts.googleapis.com/v1/token
+  audience: ` + audience + `
+  scopes: ["read"]
+policy:
+  atespaces:
+    team-a: ["other"]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.cfg = revoked
+	if _, err := fetch(s, apiURI, actorID); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("revoked grant with a cached token: got %v, want PermissionDenied", err)
+	}
+	if got := ex.calls.Load(); got != 1 {
+		t.Errorf("exchanges = %d, want 1", got)
+	}
+}
+
+func TestRunFlightRecheckFindsCachedToken(t *testing.T) {
+	ex := &fakeExchanger{lifetime: time.Hour}
+	s := newServer(t, &fakeMinter{}, ex)
+	logs := recordLogs(s)
+	key := cacheKey{"team-a", "agent-1", "api"}
+	s.store(key, tokenexchange.Token{AccessToken: "cached", ExpiresAt: time.Now().Add(time.Hour)})
+	p, _ := s.cfg.Profile("api")
+
+	f, err := s.runFlight(key, actorID, p)
+	if err != nil || f.token != "cached" || f.exchanged {
+		t.Errorf("runFlight = %+v, %v; want the cached token, not exchanged", f, err)
+	}
+	if ex.calls.Load() != 0 || logs.count(slog.LevelInfo, "token exchange") != 0 {
+		t.Errorf("exchanges = %d, Info lines = %d; want none", ex.calls.Load(), logs.count(slog.LevelInfo, "token exchange"))
+	}
+}
+
+func TestReuseFor(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			expiresIn time.Duration // zero means no expires_in
+			want      time.Duration
+		}{
+			{"no expires_in", 0, unknownExpiryReuse},
+			{"a third of the lifetime", time.Hour, 40 * time.Minute},
+			{"30s margin", 60 * time.Second, 30 * time.Second},
+			{"capped", 48 * time.Hour, maxReuse},
+			{"30s left", 30 * time.Second, 0},
+			{"10s left", 10 * time.Second, -20 * time.Second},
+			{"already expired", -time.Minute, -90 * time.Second},
+		} {
+			tok := tokenexchange.Token{AccessToken: "at"}
+			if tc.expiresIn != 0 {
+				tok.ExpiresAt = time.Now().Add(tc.expiresIn)
+			}
+			if got := reuseFor(tok); got != tc.want {
+				t.Errorf("%s: reuseFor = %v, want %v", tc.name, got, tc.want)
+			}
+			s := newServer(t, &fakeMinter{}, &fakeExchanger{})
+			key := cacheKey{"team-a", "agent-1", "api"}
+			stored := s.store(key, tok)
+			_, cached := s.cached(key)
+			if wantCached := tc.want > 0; cached != wantCached || (cached && stored != tc.want) || (!cached && stored != 0) {
+				t.Errorf("%s: store = %v, cached = %v; want cached for %v only if positive", tc.name, stored, cached, tc.want)
+			}
+		}
+	})
+}
+
+// logRecorder is a slog.Handler that keeps every record.
+type logRecorder struct {
+	mu   sync.Mutex
+	recs []slog.Record
+}
+
+// recordLogs sends s's logs to a new logRecorder.
+func recordLogs(s *Server) *logRecorder {
+	r := &logRecorder{}
+	s.log = slog.New(r)
+	return r
+}
+
+func (r *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
+
+func (r *logRecorder) Handle(_ context.Context, rec slog.Record) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recs = append(r.recs, rec.Clone())
+	return nil
+}
+
+func (r *logRecorder) WithAttrs([]slog.Attr) slog.Handler { return r }
+func (r *logRecorder) WithGroup(string) slog.Handler      { return r }
+
+// count returns how many records have level and msg.
+func (r *logRecorder) count(level slog.Level, msg string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, rec := range r.recs {
+		if rec.Level == level && rec.Message == msg {
+			n++
+		}
+	}
+	return n
 }
 
 func TestFetchSecretServerContextBoundsExchange(t *testing.T) {

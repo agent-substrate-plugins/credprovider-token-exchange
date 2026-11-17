@@ -124,8 +124,14 @@ type Server struct {
 	tokens *cache.Expiring
 	// group collapses concurrent exchanges of one token into a single call.
 	group singleflight.Group
+
+	log *slog.Logger
 }
 
+// cacheKey names a cached token. It holds no actor UID because
+// FetchSecretRequest carries none, only the actor's SPIFFE ID, so an actor
+// deleted and recreated under the same name can get its predecessor's token
+// until that token stops being reused.
 type cacheKey struct{ atespace, name, profile string }
 
 func (k cacheKey) String() string { return k.atespace + "/" + k.name + "/" + k.profile }
@@ -144,6 +150,7 @@ func NewServer(ctx context.Context, cfg *config.Config, minter Minter, exchanger
 		exchanger:    exchanger,
 		fetchTimeout: fetchTimeout,
 		tokens:       cache.NewExpiring(),
+		log:          slog.Default(),
 	}
 }
 
@@ -164,26 +171,42 @@ func (s *Server) FetchSecret(ctx context.Context, req *credprovider.FetchSecretR
 		slog.String("outcome", status.Code(err).String()),
 		slog.Duration("latency", time.Since(start)),
 	}
+	// Each exchange is logged once, by the flight that ran it (runFlight), at
+	// Info, or Warn if it failed. A request that got its outcome from a flight
+	// or the cache is logged here only at Debug. One that failed before
+	// reaching a flight, or gave up waiting for one, is logged at Warn.
 	switch {
+	case err != nil && (source == "" || source == "abandoned"):
+		s.log.WarnContext(ctx, "fetch secret failed", append(attrs, slog.String("err", status.Convert(err).Message()))...)
 	case err != nil:
-		slog.WarnContext(ctx, "token exchange failed", append(attrs, slog.String("err", status.Convert(err).Message()))...)
-		return nil, err
-	case source == "miss":
-		slog.InfoContext(ctx, "token exchange", attrs...)
+		s.log.DebugContext(ctx, "fetch secret failed", append(attrs, slog.String("err", status.Convert(err).Message()))...)
 	default:
-		slog.DebugContext(ctx, "token exchange", attrs...)
+		s.log.DebugContext(ctx, "fetch secret", attrs...)
+	}
+	if err != nil {
+		return nil, err
 	}
 	return &credprovider.FetchSecretResponse{OpaqueBytes: []byte(tok)}, nil
 }
 
+// flight is the result of one exchange flight.
+type flight struct {
+	token string
+	// exchanged is false when the flight found the token already cached, by
+	// a flight that finished after the caller looked.
+	exchanged bool
+}
+
 // fetch authorizes the request and returns a token and where it came from:
-// the cache ("hit"), a new exchange ("miss"), one already in flight
-// ("shared"), or none because the caller gave up ("abandoned").
+// the cache ("hit"), an exchange this call ran ("miss"), an exchange another
+// call ran ("shared"), or none because the caller gave up ("abandoned").
 func (s *Server) fetch(ctx context.Context, actorID, profileName string) (string, string, error) {
 	atespace, name, err := parseActorSPIFFEID(actorID)
 	if err != nil {
 		return "", "", status.Errorf(codes.PermissionDenied, "invalid actor SPIFFE ID: %v", err)
 	}
+	// The policy check stays ahead of the cache lookup, so a cached token is
+	// never served to an atespace the policy doesn't grant it.
 	if !s.cfg.Allowed(atespace, profileName) {
 		return "", "", status.Errorf(codes.PermissionDenied, "atespace %q is not granted profile %q", atespace, profileName)
 	}
@@ -197,32 +220,61 @@ func (s *Server) fetch(ctx context.Context, actorID, profileName string) (string
 		return tok, "hit", nil
 	}
 
+	// Only the call that starts the flight runs this function, so led tells
+	// it apart from calls that join. singleflight's Result.Shared can't: once
+	// any call joins, it is true for the starter too. led is read only after
+	// the result arrives on ch, which is sent after the function returns.
+	led := false
 	ch := s.group.DoChan(key.String(), func() (any, error) {
-		if tok, ok := s.cached(key); ok {
-			return tok, nil
-		}
-		fctx, cancel := context.WithTimeout(s.ctx, s.fetchTimeout)
-		defer cancel()
-		t, err := s.exchange(fctx, atespace, name, profile)
-		if err != nil {
-			return nil, err
-		}
-		s.store(key, t)
-		return t.AccessToken, nil
+		led = true
+		f, err := s.runFlight(key, actorID, profile)
+		return f, err
 	})
 	select {
 	case <-ctx.Done():
 		return "", "abandoned", status.FromContextError(ctx.Err()).Err()
 	case r := <-ch:
-		source := "miss"
-		if r.Shared {
-			source = "shared"
+		source := "shared"
+		if led {
+			source = "miss"
 		}
 		if r.Err != nil {
 			return "", source, r.Err
 		}
-		return r.Val.(string), source, nil
+		f := r.Val.(flight)
+		if led && !f.exchanged {
+			source = "hit"
+		}
+		return f.token, source, nil
 	}
+}
+
+// runFlight returns key's token from the cache, if a flight that finished
+// after the caller looked filled it, or else from a new exchange under the
+// server context, which it caches. It logs each exchange, and since it runs
+// to the end even when every caller has given up, its line is the only record
+// of an exchange nobody waited for.
+func (s *Server) runFlight(key cacheKey, actorID string, p *config.Profile) (flight, error) {
+	if tok, ok := s.cached(key); ok {
+		return flight{token: tok}, nil
+	}
+	start := time.Now()
+	fctx, cancel := context.WithTimeout(s.ctx, s.fetchTimeout)
+	defer cancel()
+	t, err := s.exchange(fctx, key.atespace, key.name, p)
+	attrs := []any{
+		slog.String("actor", actorID),
+		slog.String("profile", p.Name),
+		slog.String("outcome", status.Code(err).String()),
+		slog.Duration("latency", time.Since(start)),
+	}
+	if err != nil {
+		s.log.WarnContext(fctx, "token exchange failed", append(attrs, slog.String("err", status.Convert(err).Message()))...)
+		return flight{}, err
+	}
+	reuse := s.store(key, t)
+	s.log.InfoContext(fctx, "token exchange", append(attrs, slog.Duration("cachedFor", reuse))...)
+	return flight{token: t.AccessToken, exchanged: true}, nil
 }
 
 func (s *Server) exchange(ctx context.Context, atespace, name string, p *config.Profile) (tokenexchange.Token, error) {
@@ -239,11 +291,15 @@ func (s *Server) cached(key cacheKey) (string, bool) {
 	return tok, ok
 }
 
-// store caches t for reuseFor(t), if that is positive.
-func (s *Server) store(key cacheKey, t tokenexchange.Token) {
-	if reuse := reuseFor(t); reuse > 0 {
-		s.tokens.Set(key, t.AccessToken, reuse)
+// store caches t for reuseFor(t), if that is positive, and returns how long
+// it cached t, or 0.
+func (s *Server) store(key cacheKey, t tokenexchange.Token) time.Duration {
+	reuse := reuseFor(t)
+	if reuse <= 0 {
+		return 0
 	}
+	s.tokens.Set(key, t.AccessToken, reuse)
+	return reuse
 }
 
 // reuseFor is how long token is served from the cache: until a third of its
