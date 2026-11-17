@@ -80,6 +80,12 @@ func TestParseInvalid(t *testing.T) {
 		"bad atespace":         {"team-b:", "Team_B:", "atespace"},
 		"no audience":          {otherAudience + "\n", "", "audience is required"},
 		"long audience":        {otherAudience, "  audience: //" + strings.Repeat("a", 600), "audience is required"},
+		"audience with space":  {otherAudience, `  audience: "//iam.googleapis.com/projects/456/a b"`, "printable ASCII"},
+		"audience with CRLF":   {otherAudience, `  audience: "//iam.googleapis.com/projects/456/a\r\nb"`, "printable ASCII"},
+		"audience with NUL":    {otherAudience, `  audience: "//iam.googleapis.com/projects/456/a\u0000"`, "printable ASCII"},
+		"non-ASCII audience":   {otherAudience, `  audience: "//iam.googleapis.com/projects/456/é"`, "printable ASCII"},
+		"https audience":       {otherAudience, "  audience: https://iam.googleapis.com/projects/456/locations/global/workloadIdentityPools/p/providers/q", "starting with //iam.googleapis.com/"},
+		"other audience":       {otherAudience, "  audience: https://evil.example", "starting with //iam.googleapis.com/"},
 		"no scopes":            {otherScopes, "scopes: []", "at least one scope"},
 		"scope with space":     {otherScopes, `scopes: ["a b"]`, "invalid scope"},
 		"scope with quote":     {otherScopes, `scopes: ['a"b']`, "invalid scope"},
@@ -114,5 +120,17 @@ func TestLoad(t *testing.T) {
 	}
 	if _, err := Load(filepath.Join(t.TempDir(), "missing.yaml")); err == nil {
 		t.Error("Load accepted a missing file")
+	}
+}
+
+func TestParseAcceptsWorkforcePoolAudience(t *testing.T) {
+	const workforce = "//iam.googleapis.com/locations/global/workforcePools/p/providers/q"
+	cfg := strings.Replace(valid, "//iam.googleapis.com/projects/456/locations/global/workloadIdentityPools/p/providers/q", workforce, 1)
+	c, err := Parse([]byte(cfg))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p, _ := c.Profile("other"); p.Audience != workforce {
+		t.Errorf("audience = %q, want %q", p.Audience, workforce)
 	}
 }

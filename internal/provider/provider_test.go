@@ -282,17 +282,20 @@ func TestFetchSecretEndToEnd(t *testing.T) {
 	defer control.mu.Unlock()
 	req := control.reqs[0]
 	if req.GetActor().GetAtespace() != "team-a" || req.GetActor().GetName() != "agent-1" ||
-		len(req.GetAudiences()) != 1 || req.GetAudiences()[0] != audience || req.GetExpirationSeconds() != 300 {
+		len(req.GetAudiences()) != 1 || req.GetAudiences()[0] != audience || req.GetExpirationSeconds() != 3600 {
 		t.Errorf("MintActorJwt request = %v", req)
 	}
 }
 
 func TestFetchSecretMintErrors(t *testing.T) {
 	for in, want := range map[codes.Code]codes.Code{
-		codes.NotFound:         codes.PermissionDenied,
-		codes.Unavailable:      codes.Unavailable,
-		codes.DeadlineExceeded: codes.DeadlineExceeded,
-		codes.PermissionDenied: codes.FailedPrecondition,
+		codes.NotFound:          codes.PermissionDenied,
+		codes.Unavailable:       codes.Unavailable,
+		codes.DeadlineExceeded:  codes.DeadlineExceeded,
+		codes.ResourceExhausted: codes.Unavailable,
+		codes.Aborted:           codes.Unavailable,
+		codes.PermissionDenied:  codes.FailedPrecondition,
+		codes.Internal:          codes.FailedPrecondition,
 	} {
 		control := &fakeControl{err: status.Error(in, "boom")}
 		s := newServer(t, ControlMinter{Client: startControl(t, control)}, &fakeExchanger{})

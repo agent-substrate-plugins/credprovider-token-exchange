@@ -40,10 +40,14 @@ import (
 )
 
 const (
-	uriScheme            = "ate-secret"
-	tokenExchangePrefix  = "/token-exchange/"
-	actorTrustDomain     = "substrate-actor.local"
-	actorJWTLifetimeSecs = 300
+	uriScheme           = "ate-secret"
+	tokenExchangePrefix = "/token-exchange/"
+	actorTrustDomain    = "substrate-actor.local"
+
+	// actorJWTLifetimeSecs is the most MintActorJwt accepts. Google Cloud STS
+	// ends the federated token when the subject JWT expires, so the JWT
+	// lifetime bounds how long the exchanged token can be cached.
+	actorJWTLifetimeSecs = 3600
 
 	// DefaultFetchTimeout leaves headroom under the egress gateway's 4s
 	// credential injection timeout.
@@ -66,7 +70,11 @@ type ControlMinter struct {
 }
 
 // MintActorJWT calls Control.MintActorJwt, mapping its errors to FetchSecret
-// codes.
+// codes: NotFound to PermissionDenied; Unavailable, DeadlineExceeded and
+// Canceled kept; ResourceExhausted and Aborted, which a retry can get past, to
+// Unavailable; anything else to FailedPrecondition. The gateway answers
+// PermissionDenied and FailedPrecondition with 403, and Unavailable and
+// DeadlineExceeded with a retryable 503.
 func (m ControlMinter) MintActorJWT(ctx context.Context, atespace, name, audience string) (string, error) {
 	resp, err := m.Client.MintActorJwt(ctx, &ateapi.MintActorJwtRequest{
 		Actor:             &ateapi.ObjectRef{Atespace: atespace, Name: name},
@@ -80,6 +88,8 @@ func (m ControlMinter) MintActorJWT(ctx context.Context, atespace, name, audienc
 			return "", status.Errorf(codes.PermissionDenied, "MintActorJwt: actor not found: %s", st.Message())
 		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
 			return "", status.Errorf(st.Code(), "MintActorJwt: %s", st.Message())
+		case codes.ResourceExhausted, codes.Aborted:
+			return "", status.Errorf(codes.Unavailable, "MintActorJwt: %s: %s", st.Code(), st.Message())
 		default:
 			return "", status.Errorf(codes.FailedPrecondition, "MintActorJwt: %s: %s", st.Code(), st.Message())
 		}
