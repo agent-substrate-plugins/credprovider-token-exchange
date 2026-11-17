@@ -237,6 +237,7 @@ make verify             # gofmt, go vet, go mod tidy check
 make fmt                # gofmt -w .
 make release-manifest   # manifests with the image pinned by digest
 make release-images     # VERSION=<tag> KO_DOCKER_REPO=<repo>: push the release image
+hack/release/draft-release.sh [--dry-run] <tag>   # draft the GitHub release for a pushed tag
 ```
 
 Three packages are copies of substrate code kept in step by hand, since only
