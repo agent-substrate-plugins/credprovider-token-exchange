@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf8"
 
@@ -74,12 +75,14 @@ func respond(status int, body string) http.HandlerFunc {
 
 func TestExchangeSendsTokenExchangeForm(t *testing.T) {
 	for _, tt := range []struct {
-		name   string
-		scopes []string
-		want   url.Values
+		name     string
+		audience string
+		scopes   []string
+		want     url.Values
 	}{{
-		name:   "scopes are space-joined",
-		scopes: []string{"https://www.googleapis.com/auth/cloud-platform", "read"},
+		name:     "scopes are space-joined",
+		audience: audience,
+		scopes:   []string{"https://www.googleapis.com/auth/cloud-platform", "read"},
 		want: url.Values{
 			"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
 			"subject_token":        {subjectToken},
@@ -89,12 +92,21 @@ func TestExchangeSendsTokenExchangeForm(t *testing.T) {
 			"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
 		},
 	}, {
-		name: "no scope without scopes",
+		name:     "no scope without scopes",
+		audience: audience,
 		want: url.Values{
 			"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
 			"subject_token":        {subjectToken},
 			"subject_token_type":   {"urn:ietf:params:oauth:token-type:jwt"},
 			"audience":             {audience},
+			"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
+		},
+	}, {
+		name: "no audience without audience",
+		want: url.Values{
+			"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
+			"subject_token":        {subjectToken},
+			"subject_token_type":   {"urn:ietf:params:oauth:token-type:jwt"},
 			"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
 		},
 	}} {
@@ -113,7 +125,7 @@ func TestExchangeSendsTokenExchangeForm(t *testing.T) {
 				got = r.PostForm
 				respond(http.StatusOK, `{"access_token":"at","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"Bearer","expires_in":600}`)(w, r)
 			})
-			if _, err := c.Exchange(t.Context(), srv.URL+"/token", subjectToken, audience, tt.scopes); err != nil {
+			if _, err := c.Exchange(t.Context(), srv.URL+"/token", subjectToken, tt.audience, tt.scopes); err != nil {
 				t.Fatalf("Exchange: %v", err)
 			}
 			if diff := cmp.Diff(tt.want, got); diff != "" {
@@ -245,6 +257,52 @@ func TestExchangeDoesNotFollowRedirects(t *testing.T) {
 	}
 }
 
+func TestExchangeRejectsPlainHTTP(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		respond(http.StatusOK, `{"access_token":"at"}`)(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	c, err := New("")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = c.Exchange(t.Context(), srv.URL+"/token", subjectToken, audience, nil)
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Errorf("Exchange error = %v (code %v), want code %v", err, got, codes.FailedPrecondition)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("the server got %d requests, want 0", n)
+	}
+}
+
+func TestExchangeReportsUnparsedErrorBody(t *testing.T) {
+	long := strings.Repeat("b", maxDetailBytes+50)
+	for _, tt := range []struct {
+		name   string
+		status int
+		body   string
+		want   string // the error's suffix after "token endpoint returned <status>"
+	}{
+		{"403 plain text", http.StatusForbidden, "blocked by policy", `: body "blocked by policy"`},
+		{"403 with an error object", http.StatusForbidden, `{"error":{"code":403}}`, `: body "{\"error\":{\"code\":403}}"`},
+		{"500 plain text", http.StatusInternalServerError, "upstream down", `: body "upstream down"`},
+		{"long body is clipped", http.StatusBadGateway, long, fmt.Sprintf(": body %q", long[:maxDetailBytes])},
+		{"empty body", http.StatusForbidden, "", ""},
+		{"OAuth error", http.StatusForbidden, `{"error":"access_denied"}`, `: error "access_denied", error_description ""`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, c := newTestServer(t, respond(tt.status, tt.body))
+			_, err := c.Exchange(t.Context(), srv.URL+"/token", subjectToken, audience, nil)
+			want := fmt.Sprintf("token endpoint returned %d%s", tt.status, tt.want)
+			if got := status.Convert(err).Message(); got != want {
+				t.Errorf("Exchange error message = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestExchangeClipsErrorDescription(t *testing.T) {
 	description := strings.Repeat("d", maxDetailBytes+50)
 	srv, c := newTestServer(t, respond(http.StatusBadRequest, fmt.Sprintf(`{"error":"invalid_request","error_description":%q}`, description)))
@@ -297,53 +355,64 @@ func TestExchangeCanceledContext(t *testing.T) {
 	}
 }
 
-// stallingServer starts a server that sends a 200 status line and headers,
-// then stalls before the body until the test ends. headersSent is closed once
-// the headers are flushed. The handler ignores the request's context: ending
-// the response when the client hangs up could hand the client a complete,
-// empty body instead of the error under test.
-func stallingServer(t *testing.T) (srv *httptest.Server, c *Client, headersSent <-chan struct{}) {
-	t.Helper()
-	sent := make(chan struct{})
-	release := make(chan struct{})
-	srv, c = newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.(http.Flusher).Flush()
-		close(sent)
-		<-release
-	})
-	// Registered after newTestServer's srv.Close, so it runs first and an
-	// unfinished handler can't block the close.
-	t.Cleanup(func() { close(release) })
-	return srv, c, sent
+// roundTripFunc is an http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// ctxBody is a response body whose Read calls onRead, then waits for ctx to end
+// and fails with its error.
+type ctxBody struct {
+	ctx    context.Context
+	onRead func()
 }
 
+func (b ctxBody) Read([]byte) (int, error) {
+	b.onRead()
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (ctxBody) Close() error { return nil }
+
 func TestExchangeContextEndsDuringBodyRead(t *testing.T) {
-	t.Run("deadline", func(t *testing.T) {
-		srv, c, _ := stallingServer(t)
-		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-		defer cancel()
-		_, err := c.Exchange(ctx, srv.URL+"/token", subjectToken, audience, nil)
-		if got := status.Code(err); got != codes.DeadlineExceeded {
-			t.Errorf("Exchange error = %v (code %v), want code %v", err, got, codes.DeadlineExceeded)
-		}
-	})
-	t.Run("cancel", func(t *testing.T) {
-		srv, c, headersSent := stallingServer(t)
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-		go func() {
-			<-headersSent
-			// Give the client time to return from Do and block reading the body.
-			time.Sleep(50 * time.Millisecond)
-			cancel()
-		}()
-		_, err := c.Exchange(ctx, srv.URL+"/token", subjectToken, audience, nil)
-		if got := status.Code(err); got != codes.Canceled {
-			t.Errorf("Exchange error = %v (code %v), want code %v", err, got, codes.Canceled)
-		}
-	})
+	for _, tt := range []struct {
+		name string
+		// cancelOnRead cancels the context from the body read. Otherwise the
+		// read waits out the context's deadline on synctest's fake clock.
+		cancelOnRead bool
+		wantCode     codes.Code
+	}{
+		{"deadline", false, codes.DeadlineExceeded},
+		{"cancel", true, codes.Canceled},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+				defer cancel()
+				var read bool
+				c := &Client{httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body: ctxBody{ctx: r.Context(), onRead: func() {
+							read = true
+							if tt.cancelOnRead {
+								cancel()
+							}
+						}},
+						Request: r,
+					}, nil
+				})}}
+				_, err := c.Exchange(ctx, "https://sts.example/token", subjectToken, audience, nil)
+				if got := status.Code(err); got != tt.wantCode {
+					t.Errorf("Exchange error = %v (code %v), want code %v", err, got, tt.wantCode)
+				}
+				if !read {
+					t.Error("Exchange did not read the response body")
+				}
+			})
+		})
+	}
 }
 
 func TestExchangeUnreachableEndpoint(t *testing.T) {

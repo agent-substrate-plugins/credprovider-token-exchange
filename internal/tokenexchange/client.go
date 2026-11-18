@@ -99,17 +99,21 @@ func New(caFile string) (*Client, error) {
 }
 
 // Exchange trades subjectToken, a JWT, for an access token at tokenURL within
-// ctx. Errors carry a gRPC code: PermissionDenied for a 403 or an OAuth denial,
-// FailedPrecondition for any other non-200 status below 429, DeadlineExceeded
-// or Canceled when ctx ends before the response is read, and Unavailable for
-// 429, 5xx, a failed connection, or an unusable 200 response.
+// ctx. The audience parameter is omitted when audience is empty. Errors carry
+// a gRPC code: PermissionDenied for a 403 or an OAuth denial,
+// FailedPrecondition for a tokenURL that is not https or any other non-200
+// status below 429, DeadlineExceeded or Canceled when ctx ends before the
+// response is read, and Unavailable for 429, 5xx, a failed connection, or an
+// unusable 200 response.
 func (c *Client) Exchange(ctx context.Context, tokenURL, subjectToken, audience string, scopes []string) (Token, error) {
 	form := url.Values{
 		"grant_type":           {grantTypeTokenExchange},
 		"subject_token":        {subjectToken},
 		"subject_token_type":   {tokenTypeJWT},
-		"audience":             {audience},
 		"requested_token_type": {tokenTypeAccessToken},
+	}
+	if audience != "" {
+		form.Set("audience", audience)
 	}
 	if len(scopes) > 0 {
 		form.Set("scope", strings.Join(scopes, " "))
@@ -117,6 +121,11 @@ func (c *Client) Exchange(ctx context.Context, tokenURL, subjectToken, audience 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return Token{}, status.Errorf(codes.FailedPrecondition, "building token exchange request: %v", err)
+	}
+	// The form carries the subject token, which must not travel in cleartext
+	// (RFC 6749 section 3.2, RFC 8693 section 2.1).
+	if req.URL.Scheme != "https" {
+		return Token{}, status.Errorf(codes.FailedPrecondition, "token URL scheme is %q, want https", req.URL.Scheme)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
@@ -150,7 +159,13 @@ func (c *Client) Exchange(ctx context.Context, tokenURL, subjectToken, audience 
 	case (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized) && deniedErrors[oauthErr.Error]:
 		code = codes.PermissionDenied
 	}
-	return Token{}, status.Errorf(code, "token endpoint returned %d%s", resp.StatusCode, oauthErr.detail())
+	detail := oauthErr.detail()
+	if detail == "" && len(body) > 0 {
+		// The body is not an OAuth error response, for example a proxy's
+		// plain-text page, so report the body itself.
+		detail = fmt.Sprintf(": body %q", clip(string(body)))
+	}
+	return Token{}, status.Errorf(code, "token endpoint returned %d%s", resp.StatusCode, detail)
 }
 
 // transportError maps an error from sending the request or reading the
