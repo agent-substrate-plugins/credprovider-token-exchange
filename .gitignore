@@ -1,5 +1,7 @@
 # Binaries
 /bin/
+# stray output from `go build` without -o
+/credprovider-token-exchange
 
 # Test artifacts (JUnit XML, gotestsum JSON)
 /_artifacts/
