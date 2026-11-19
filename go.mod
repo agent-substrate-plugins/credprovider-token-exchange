@@ -7,6 +7,7 @@ toolchain go1.27.3
 require (
 	github.com/google/go-cmp v0.7.0
 	go.ate.dev/substrate v1.0.0-rc.1
+	golang.org/x/sync v0.23.0
 	google.golang.org/grpc v1.83.2
 	k8s.io/apimachinery v0.37.0
 	sigs.k8s.io/yaml v1.6.0
