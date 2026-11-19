@@ -159,7 +159,8 @@ func TestRunValidatesFlags(t *testing.T) {
 	}
 }
 
-// exampleConfig returns config.yaml from config/config-example.yaml.
+// exampleConfig returns config.yaml from config/config-example.yaml, with
+// sample values for the placeholders an installer fills in.
 func exampleConfig(t *testing.T) string {
 	t.Helper()
 	b, err := os.ReadFile("../../config/config-example.yaml")
@@ -172,7 +173,11 @@ func exampleConfig(t *testing.T) string {
 	if err := yaml.Unmarshal(b, &cm); err != nil {
 		t.Fatal(err)
 	}
-	return cm.Data["config.yaml"]
+	return strings.NewReplacer(
+		"PROJECT_NUMBER", "123456789012",
+		"POOL", "substrate-actors",
+		"PROVIDER", "my-cluster",
+	).Replace(cm.Data["config.yaml"])
 }
 
 func TestConfigExampleParses(t *testing.T) {

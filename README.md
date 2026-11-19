@@ -44,7 +44,7 @@ Deployment after changing it.
 | `providerName` | Host of the `ate-secret://` URIs the provider serves; a lowercase DNS-1123 subdomain |
 | `profiles[].name` | Referenced from the credential URI and the policy |
 | `profiles[].tokenUrl` | Must be `https://sts.googleapis.com/v1/token` |
-| `profiles[].audience` | RFC 8693 `audience` and the minted actor JWT's `aud`: the identity pool provider's resource name, starting with `//iam.googleapis.com/` |
+| `profiles[].audience` | RFC 8693 `audience` and the minted actor JWT's `aud`: the workload identity pool provider's resource name, `//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER` |
 | `profiles[].scopes` | RFC 8693 `scope`; at least one |
 | `policy.atespaces` | Profiles each atespace may use; an atespace not listed gets none |
 
