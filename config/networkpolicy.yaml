@@ -1,0 +1,81 @@
+# Copyright 2026 The Agent Substrate Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Ingress only from the egress gateway. Egress only to ate-api-server, DNS on
+# port 53 at any address (node-local caches and cloud resolvers sit outside
+# kube-dns), and public addresses on 443.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: credprovider-token-exchange
+  namespace: ate-system
+spec:
+  podSelector:
+    matchLabels:
+      app: credprovider-token-exchange
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: atenet-egress
+    ports:
+    - protocol: TCP
+      port: 50051
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: ate-api-server
+    ports:
+    - protocol: TCP
+      port: 443
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except: [10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16]
+    - ipBlock:
+        cidr: ::/0
+        except: ["::1/128", "fc00::/7", "fe80::/10"]
+    ports:
+    - protocol: TCP
+      port: 443
+---
+# ate-api-server's own policy admits only a fixed set of app labels.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: credprovider-token-exchange-to-ate-api-server
+  namespace: ate-system
+spec:
+  podSelector:
+    matchLabels:
+      app: ate-api-server
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: credprovider-token-exchange
+    ports:
+    - protocol: TCP
+      port: 443
