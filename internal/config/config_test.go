@@ -84,8 +84,13 @@ func TestParseInvalid(t *testing.T) {
 		"audience with CRLF":   {otherAudience, `  audience: "//iam.googleapis.com/projects/456/a\r\nb"`, "printable ASCII"},
 		"audience with NUL":    {otherAudience, `  audience: "//iam.googleapis.com/projects/456/a\u0000"`, "printable ASCII"},
 		"non-ASCII audience":   {otherAudience, `  audience: "//iam.googleapis.com/projects/456/é"`, "printable ASCII"},
-		"https audience":       {otherAudience, "  audience: https://iam.googleapis.com/projects/456/locations/global/workloadIdentityPools/p/providers/q", "starting with //iam.googleapis.com/"},
-		"other audience":       {otherAudience, "  audience: https://evil.example", "starting with //iam.googleapis.com/"},
+		"https audience":       {otherAudience, "  audience: https://iam.googleapis.com/projects/456/locations/global/workloadIdentityPools/p/providers/q", "workload identity pool provider"},
+		"other audience":       {otherAudience, "  audience: https://evil.example", "workload identity pool provider"},
+		"workforce audience":   {otherAudience, "  audience: //iam.googleapis.com/locations/global/workforcePools/p/providers/q", "workload identity pool provider"},
+		"bare iam audience":    {otherAudience, "  audience: //iam.googleapis.com/", "workload identity pool provider"},
+		"project id audience":  {otherAudience, "  audience: //iam.googleapis.com/projects/my-project/locations/global/workloadIdentityPools/p/providers/q", "workload identity pool provider"},
+		"pool audience":        {otherAudience, "  audience: //iam.googleapis.com/projects/456/locations/global/workloadIdentityPools/p", "workload identity pool provider"},
+		"audience extra path":  {otherAudience, "  audience: //iam.googleapis.com/projects/456/locations/global/workloadIdentityPools/p/providers/q/keys/k", "workload identity pool provider"},
 		"no scopes":            {otherScopes, "scopes: []", "at least one scope"},
 		"scope with space":     {otherScopes, `scopes: ["a b"]`, "invalid scope"},
 		"scope with quote":     {otherScopes, `scopes: ['a"b']`, "invalid scope"},
@@ -120,17 +125,5 @@ func TestLoad(t *testing.T) {
 	}
 	if _, err := Load(filepath.Join(t.TempDir(), "missing.yaml")); err == nil {
 		t.Error("Load accepted a missing file")
-	}
-}
-
-func TestParseAcceptsWorkforcePoolAudience(t *testing.T) {
-	const workforce = "//iam.googleapis.com/locations/global/workforcePools/p/providers/q"
-	cfg := strings.Replace(valid, "//iam.googleapis.com/projects/456/locations/global/workloadIdentityPools/p/providers/q", workforce, 1)
-	c, err := Parse([]byte(cfg))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if p, _ := c.Profile("other"); p.Audience != workforce {
-		t.Errorf("audience = %q, want %q", p.Audience, workforce)
 	}
 }

@@ -20,7 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
+	"regexp"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
@@ -31,10 +31,13 @@ const (
 	maxAudienceLen = 512
 	// GCPSTSURL is the only token endpoint supported so far.
 	GCPSTSURL = "https://sts.googleapis.com/v1/token"
-	// GCPAudiencePrefix starts the resource name of every workload and
-	// workforce identity pool provider, the audience GCPSTSURL expects.
-	GCPAudiencePrefix = "//iam.googleapis.com/"
+	// gcpAudienceFormat is the resource name format of a workload identity
+	// pool provider, the audience GCPSTSURL expects.
+	gcpAudienceFormat = "//iam.googleapis.com/projects/<project-number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>"
 )
+
+// gcpAudience matches gcpAudienceFormat.
+var gcpAudience = regexp.MustCompile(`^//iam\.googleapis\.com/projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]+/providers/[a-z0-9-]+$`)
 
 // Config is the provider's configuration file.
 type Config struct {
@@ -139,8 +142,8 @@ func (p *Profile) validate() error {
 	if !isScopeToken(p.Audience) {
 		return fmt.Errorf("profile %q: audience %q must be printable ASCII without spaces, '\"' or '\\'", p.Name, p.Audience)
 	}
-	if !strings.HasPrefix(p.Audience, GCPAudiencePrefix) {
-		return fmt.Errorf("profile %q: audience %q must be an identity pool provider's resource name, starting with %s, while tokenUrl is %s", p.Name, p.Audience, GCPAudiencePrefix, GCPSTSURL)
+	if !gcpAudience.MatchString(p.Audience) {
+		return fmt.Errorf("profile %q: audience %q must be a workload identity pool provider's resource name, %s, while tokenUrl is %s", p.Name, p.Audience, gcpAudienceFormat, GCPSTSURL)
 	}
 	if len(p.Scopes) == 0 {
 		return fmt.Errorf("profile %q: at least one scope is required", p.Name)
