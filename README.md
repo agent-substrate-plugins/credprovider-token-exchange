@@ -71,7 +71,7 @@ Deployment after changing it.
 
 ## Install
 
-Prerequisites: substrate v1.0.0-rc.1 or later, and a registry for
+Prerequisites: substrate v1.0.0 or later, and a registry for
 `KO_DOCKER_REPO`. The Makefile runs [ko](https://ko.build) with `go run`.
 Releases ship no `ate-setup` binary, so steps 4 and 5 run it with
 `go run ./cmd/ate-setup` from a substrate checkout at your installed version.
@@ -237,7 +237,8 @@ make verify             # gofmt, go vet, go mod tidy check
 make fmt                # gofmt -w .
 make release-manifest   # manifests with the image pinned by digest
 make release-images     # VERSION=<tag> KO_DOCKER_REPO=<repo>: push the release image
-hack/release/draft-release.sh [--dry-run] <tag>   # draft the GitHub release for a pushed tag
+hack/release/draft-release.sh [--dry-run] <tag>   # draft the GitHub release for a pushed tag;
+                                                  # needs jq and gh logged in with write access, even for --dry-run
 ```
 
 Three packages are copies of substrate code kept in step by hand, since only

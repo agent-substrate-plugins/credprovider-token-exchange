@@ -46,7 +46,7 @@ RELEASE_IMAGE='ghcr.io/agent-substrate-plugins/credprovider-token-exchange/credp
 # The release manifest the workflow attaches to the draft.
 RELEASE_MANIFEST='credprovider-token-exchange.yaml'
 # Keep in step with the Install prerequisites in README.md.
-MIN_SUBSTRATE="v1.0.0-rc.1 or later"
+MIN_SUBSTRATE="v1.0.0 or later"
 
 usage() {
   echo "usage: $0 [--dry-run] <tag>" >&2
@@ -175,10 +175,10 @@ if [[ "${REPO}" == "${UPSTREAM_REPO}" ]]; then
   notes+=" for \`linux/amd64\` and \`linux/arm64\`."
   notes+=" The attached \`${RELEASE_MANIFEST}\` deploys it pinned by digest."
   notes+=$'\n\n## Install\n\n'
-  notes+="Requires substrate ${MIN_SUBSTRATE}. Follow [Install](https://github.com/${REPO}/blob/${tag}/README.md#install),"
-  notes+=" deploying the release manifest in place of \`make deploy\`. First apply the profiles and policy,"
-  notes+=" [\`config/config-example.yaml\`](https://github.com/${REPO}/blob/${tag}/config/config-example.yaml)"
-  notes+=" edited for your token endpoint and atespaces: the manifest leaves it out, and the provider does not start without it."
+  notes+="Requires substrate ${MIN_SUBSTRATE}. Do steps 1 and 2 of [Install](https://github.com/${REPO}/blob/${tag}/README.md#install)"
+  notes+=" (step 2 applies [\`config/config-example.yaml\`](https://github.com/${REPO}/blob/${tag}/config/config-example.yaml)"
+  notes+=" with your audience and atespace grants; the manifest leaves it out, and the provider does not start without it),"
+  notes+=" then apply the release manifest in place of step 3's \`make deploy\`:"
   notes+=$'\n\n```sh\n'
   notes+="curl -fsSLO https://github.com/${REPO}/releases/download/${tag}/${RELEASE_MANIFEST}"$'\n'
   notes+="curl -fsSLO https://github.com/${REPO}/releases/download/${tag}/${RELEASE_MANIFEST}.sha256"$'\n'
