@@ -139,6 +139,29 @@ func TestLoaderPicksUpProjectedVolumeRotation(t *testing.T) {
 	}
 }
 
+func TestClientLoaderCachesAndReloads(t *testing.T) {
+	path := writeProjectedBundle(t, makeBundle(t, 1))
+	getCert := ClientLoader(path)
+
+	first, err := getCert(nil)
+	if err != nil {
+		t.Fatalf("ClientLoader() first call error = %v", err)
+	}
+	if again, err := getCert(nil); err != nil || again != first {
+		t.Fatalf("ClientLoader() second call = %p, %v; want the cached %p", again, err, first)
+	}
+	if err := rotateProjectedBundle(path, makeBundle(t, 2)); err != nil {
+		t.Fatalf("rotate bundle: %v", err)
+	}
+	cert, err := getCert(nil)
+	if err != nil {
+		t.Fatalf("ClientLoader() after rotation error = %v", err)
+	}
+	if got := leafSerial(t, cert); got != 2 {
+		t.Fatalf("ClientLoader() leaf serial after rotation = %d, want 2", got)
+	}
+}
+
 func TestLoaderPicksUpInPlaceRewrite(t *testing.T) {
 	path := writeBundle(t, makeBundle(t, 1))
 	getCert := Loader(path)
