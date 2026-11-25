@@ -71,7 +71,7 @@ Deployment after changing it.
 
 ## Install
 
-Prerequisites: substrate v1.0.0-rc.1 or later, and a registry for
+Prerequisites: substrate v1.0.0 or later, and a registry for
 `KO_DOCKER_REPO`. The Makefile runs [ko](https://ko.build) with `go run`.
 Releases ship no `ate-setup` binary, so steps 4 and 5 run it with
 `go run ./cmd/ate-setup` from a substrate checkout at your installed version.
@@ -103,8 +103,9 @@ Releases ship no `ate-setup` binary, so steps 4 and 5 run it with
      > idp-ca.crt
    kubectl -n ate-system port-forward svc/idp 8443:443 >/dev/null &
    PF_PID=$!
-   sleep 2
    IDP=(curl -fsS --cacert idp-ca.crt --resolve idp.ate-system.svc:8443:127.0.0.1)
+   # Wait up to 30s for the port-forward; if it never comes up, the next command shows the error.
+   "${IDP[@]}" --no-show-error --retry 30 --retry-delay 1 --retry-connrefused -o /dev/null https://idp.ate-system.svc:8443/.well-known/openid-configuration
    ISSUER="$("${IDP[@]}" https://idp.ate-system.svc:8443/.well-known/openid-configuration | jq -r .issuer)"
    "${IDP[@]}" https://idp.ate-system.svc:8443/openid/v1/jwks > jwks.json
    kill "$PF_PID"
@@ -128,14 +129,23 @@ Releases ship no `ate-setup` binary, so steps 4 and 5 run it with
    The condition admits only actor tokens, whose `sub` is
    `actor/<atespace>/<name>`, and the mapping strips `actor/` to fit
    `google.subject`'s 127 bytes. Google Cloud can't reach the default
-   in-cluster issuer, hence the uploaded key set: upload it again with
-   `update-oidc` after each signing key is added or removed. If your
-   organization sets `constraints/iam.workloadIdentityPoolProviders`, its
-   allowed values must include `$ISSUER`.
+   in-cluster issuer, hence the uploaded key set. If your organization sets
+   `constraints/iam.workloadIdentityPoolProviders`, its allowed values must
+   include `$ISSUER`. After each signing key is added or removed, fetch
+   `jwks.json` again as above and upload it:
+
+   ```bash
+   gcloud iam workload-identity-pools providers update-oidc "$PROVIDER" \
+     --project="$PROJECT" --location=global --workload-identity-pool="$POOL" \
+     --jwk-json-path=jwks.json
+   ```
 
    Grant roles to one actor or to an atespace, not to the whole pool. STS
    returns a federated token, so use services that support direct resource
-   access; the provider doesn't impersonate a service account.
+   access; the provider doesn't impersonate a service account. The examples
+   grant on the project for brevity; prefer the resource, such as
+   `gcloud storage buckets add-iam-policy-binding gs://BUCKET` with the same
+   flags.
 
    ```bash
    # One actor, agent-1 in atespace team-a:
@@ -237,6 +247,8 @@ make verify             # gofmt, go vet, go mod tidy check
 make fmt                # gofmt -w .
 make release-manifest   # manifests with the image pinned by digest
 make release-images     # VERSION=<tag> KO_DOCKER_REPO=<repo>: push the release image
+hack/release/draft-release.sh [--dry-run] <tag>   # draft the GitHub release for a pushed tag;
+                                                  # needs jq and gh logged in with write access, even for --dry-run
 ```
 
 Three packages are copies of substrate code kept in step by hand, since only
