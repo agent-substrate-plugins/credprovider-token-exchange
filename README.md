@@ -104,7 +104,8 @@ Releases ship no `ate-setup` binary, so steps 4 and 5 run it with
    kubectl -n ate-system port-forward svc/idp 8443:443 >/dev/null &
    PF_PID=$!
    IDP=(curl -fsS --cacert idp-ca.crt --resolve idp.ate-system.svc:8443:127.0.0.1)
-   until "${IDP[@]}" -o /dev/null https://idp.ate-system.svc:8443/.well-known/openid-configuration 2>/dev/null; do sleep 1; done
+   # Wait up to 30s for the port-forward; if it never comes up, the next command shows the error.
+   "${IDP[@]}" --no-show-error --retry 30 --retry-delay 1 --retry-connrefused -o /dev/null https://idp.ate-system.svc:8443/.well-known/openid-configuration
    ISSUER="$("${IDP[@]}" https://idp.ate-system.svc:8443/.well-known/openid-configuration | jq -r .issuer)"
    "${IDP[@]}" https://idp.ate-system.svc:8443/openid/v1/jwks > jwks.json
    kill "$PF_PID"

@@ -56,12 +56,16 @@ usage() {
 errfile="$(mktemp)"
 trap 'rm -f "${errfile}"' EXIT
 
-# api <step> <gh api args...> prints the response. On failure it prints the
-# step and gh's error, and returns 1; gh's error stays in ${errfile}.
+source "${ROOT}/hack/util/gh-retry.sh"
+
+# api <step> <gh api args...> prints the response, retrying HTTP 5xx errors.
+# On failure it prints the step and gh's error, and returns 1; gh's error
+# stays in ${errfile}. Pipe the output to jq rather than using gh's --jq,
+# which hides the status of an HTML 5xx page, so it would not be retried.
 api() {
   local step="$1"
   shift
-  if ! gh api "$@" 2>"${errfile}"; then
+  if ! gh_with_retries api "$@" 2>"${errfile}"; then
     echo "error: ${step}: $(<"${errfile}")" >&2
     return 1
   fi
@@ -72,7 +76,7 @@ api() {
 # failure (gh not logged in, rate limit) stops the script with gh's error, so
 # it is not mistaken for "not found".
 exists() {
-  if gh api "$1" --silent 2>"${errfile}"; then
+  if gh_with_retries api "$1" --silent 2>"${errfile}"; then
     return 0
   fi
   if grep -qE 'HTTP (404|422)' "${errfile}"; then
@@ -121,7 +125,7 @@ fi
 # Tags come from the API because a local clone may lack them. As in substrate,
 # the first release's notes start at v0.0.0, on main's first commit.
 base="${tag%%-*}"
-tags="$(api "listing tags" "repos/${REPO}/tags" --paginate --jq '.[].name')"
+tags="$(api "listing tags" "repos/${REPO}/tags" --paginate | jq -r '.[].name')"
 # With no tags at all (a fork, for example), the notes would silently cover
 # the whole history. GitHub needs the previous tag in ${REPO} itself.
 if ! grep -qE "${SEMVER}" <<<"${tags}"; then
@@ -158,7 +162,7 @@ if [[ "${target}" != "${tag}" ]]; then
   generate_args+=(-f "target_commitish=${target}")
 fi
 if ! notes="$(api "generating notes" "repos/${REPO}/releases/generate-notes" \
-  "${generate_args[@]}" --jq .body)"; then
+  "${generate_args[@]}" | jq -r .body)"; then
   if grep -q 'HTTP 404' "${errfile}"; then
     echo "GitHub answers 404 here when the token cannot write to ${REPO}." \
       "Generating notes needs write access, even for --dry-run." >&2
@@ -213,7 +217,10 @@ if [[ "${dry_run}" == true ]]; then
   echo "Dry run: no release created."
   exit 0
 fi
-if gh release view "${tag}" --repo "${REPO}" >/dev/null 2>&1; then
+# Not gh release view: it can report a failed lookup as "release not found".
+existing="$(api "checking for an existing release" "repos/${REPO}/releases" \
+  --paginate | jq -r --arg tag "${tag}" '.[] | select(.tag_name == $tag) | .id')"
+if [[ -n "${existing}" ]]; then
   echo "A release for ${tag} already exists; left unchanged."
   exit 0
 fi
